@@ -1,0 +1,29 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net48</TargetFramework>
+    <Nullable>enable</Nullable>
+    <LangVersion>latest</LangVersion>
+    <UseWPF>true</UseWPF>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <RootNamespace>GPUStitch</RootNamespace>
+    <AssemblyName>GPUStitch</AssemblyName>
+    <PlatformTarget>x64</PlatformTarget>
+    <Prefer32Bit>false</Prefer32Bit>
+  </PropertyGroup>
+
+   <!-- Vortice.Windows：用于 D3D11 / DXGI / 着色器编译 -->
+  <ItemGroup>
+    <PackageReference Include="Vortice.Direct3D11" Version="2.4.2" />
+    <PackageReference Include="Vortice.DXGI" Version="2.4.2" />
+    <PackageReference Include="Vortice.D3DCompiler" Version="2.4.2" />
+    <PackageReference Include="Microsoft.Wpf.Interop.DirectX-x64" Version="0.9.0-beta-22856" />
+  </ItemGroup>
+
+  <!-- 将 HLSL 着色器作为嵌入资源编译 -->
+  <ItemGroup>
+    <EmbeddedResource Include="Shaders\*.hlsl" />
+  </ItemGroup>
+
+</Project>

@@ -1,0 +1,138 @@
+<Window
+    x:Class="GPUStitch.MainWindow"
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    xmlns:dx="clr-namespace:Microsoft.Wpf.Interop.DirectX;assembly=Microsoft.Wpf.Interop.DirectX"
+    Title="GPU 拼图 - D3D11Image 渲染器"
+    Width="1100"
+    Height="700"
+    Closing="Window_Closing"
+    Loaded="Window_Loaded">
+
+    <Window.Resources>
+        <!--  全局样式：统一按钮外观  -->
+        <Style TargetType="Button">
+            <Setter Property="Padding" Value="12,6" />
+            <Setter Property="Margin" Value="4" />
+            <Setter Property="FontSize" Value="14" />
+        </Style>
+    </Window.Resources>
+
+    <Grid>
+        <Grid.RowDefinitions>
+            <!--  工具栏区域  -->
+            <RowDefinition Height="Auto" />
+            <!--  状态信息区域  -->
+            <RowDefinition Height="Auto" />
+            <!--  图片显示区域（占据剩余空间）  -->
+            <RowDefinition Height="*" />
+        </Grid.RowDefinitions>
+
+        <!--  ===== 工具栏 =====  -->
+        <StackPanel
+            Grid.Row="0"
+            Margin="8"
+            Orientation="Horizontal">
+            <!--  加载图片按钮  -->
+            <Button
+                x:Name="BtnLoadImages"
+                Click="BtnLoadImages_Click"
+                Content="📂 加载图片" />
+            <!--  执行拼图按钮  -->
+            <Button
+                x:Name="BtnStitch"
+                Click="BtnStitch_Click"
+                Content="🧩 GPU 拼图"
+                IsEnabled="False" />
+            <!--  显示单张图片按钮  -->
+            <Button
+                x:Name="BtnShowSingle"
+                Click="BtnShowSingle_Click"
+                Content="🖼️ 显示单图"
+                IsEnabled="True" />
+            <!--  清除按钮  -->
+            <Button
+                x:Name="BtnClear"
+                Click="BtnClear_Click"
+                Content="🗑️ 清除" />
+
+            <Separator Margin="8,0" />
+
+            <!--  混合宽度滑块  -->
+            <TextBlock
+                Margin="4,0"
+                VerticalAlignment="Center"
+                Text="混合宽度:" />
+            <Slider
+                x:Name="SliderBlendWidth"
+                Width="150"
+                Margin="4,0"
+                VerticalAlignment="Center"
+                Maximum="200"
+                Minimum="0"
+                ToolTip="控制拼接重叠区域的渐变过渡宽度（像素）"
+                Value="50" />
+            <TextBlock
+                x:Name="TxtBlendValue"
+                Width="30"
+                VerticalAlignment="Center"
+                Text="50" />
+
+            <Separator Margin="8,0" />
+
+            <!--  重叠像素滑块  -->
+            <TextBlock
+                Margin="4,0"
+                VerticalAlignment="Center"
+                Text="重叠像素:" />
+            <Slider
+                x:Name="SliderOverlap"
+                Width="150"
+                Margin="4,0"
+                VerticalAlignment="Center"
+                Maximum="500"
+                Minimum="0"
+                ToolTip="相邻图片的水平重叠像素数"
+                Value="100" />
+            <TextBlock
+                x:Name="TxtOverlapValue"
+                Width="30"
+                VerticalAlignment="Center"
+                Text="100" />
+        </StackPanel>
+
+        <!--  ===== 状态栏 =====  -->
+        <Border
+            Grid.Row="1"
+            Margin="8,0"
+            Padding="8,4"
+            Background="#F0F0F0">
+            <TextBlock
+                x:Name="TxtStatus"
+                FontSize="13"
+                Foreground="#333"
+                Text="就绪 - 请加载图片" />
+        </Border>
+
+        <!--  ===== D3DImage 显示区域 =====  -->
+        <!--  使用 Image 控件显示 D3DImage，Stretch=Uniform 保持宽高比  -->
+        <ScrollViewer Grid.Row="2">
+
+
+            <Border
+                x:Name="host"
+                Background="#1E1E1E"
+                BorderBrush="#CCC"
+                BorderThickness="1">
+                <Image
+                    x:Name="D3DImageControl"
+                    RenderOptions.BitmapScalingMode="HighQuality"
+                    Stretch="Uniform">
+                    <Image.Source>
+                        <dx:D3D11Image x:Name="InteropImage" />
+                    </Image.Source>
+                </Image>
+            </Border>
+        </ScrollViewer>
+    </Grid>
+</Window>
