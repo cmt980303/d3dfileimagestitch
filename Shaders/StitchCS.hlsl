@@ -11,6 +11,7 @@
 cbuffer StitchImageParams : register(b0)
 {
     float4 ImageParam;  // x=offsetX, y=offsetY, z=displayWidth, w=displayHeight
+    float4 FeatherParam; // x=left, y=right, z=top, w=bottom
     float2 OutputSize;  // canvas width / height
     float  BlendWidth;
     float  Padding0;
@@ -26,13 +27,21 @@ float ComputeBlendWeight(float2 localPos, float2 imageSize)
     if (BlendWidth <= 0.0)
         return 1.0;
 
-    float distLeft   = localPos.x;
-    float distRight  = imageSize.x - localPos.x;
-    float distTop    = localPos.y;
-    float distBottom = imageSize.y - localPos.y;
+    float weight = 1.0;
 
-    float minDist = min(min(distLeft, distRight), min(distTop, distBottom));
-    return saturate(minDist / BlendWidth);
+    if (FeatherParam.x > 0.0)
+        weight *= smoothstep(0.0, FeatherParam.x, localPos.x);
+
+    if (FeatherParam.y > 0.0)
+        weight *= smoothstep(0.0, FeatherParam.y, imageSize.x - localPos.x);
+
+    if (FeatherParam.z > 0.0)
+        weight *= smoothstep(0.0, FeatherParam.z, localPos.y);
+
+    if (FeatherParam.w > 0.0)
+        weight *= smoothstep(0.0, FeatherParam.w, imageSize.y - localPos.y);
+
+    return max(weight, 1e-4);
 }
 
 [numthreads(8, 8, 1)]
@@ -44,7 +53,7 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID)
     if (localPixel.x >= imageSize.x || localPixel.y >= imageSize.y)
         return;
 
-    int2 dstPixel = int2(ImageParam.xy) + localPixel;
+    int2 dstPixel = int2(round(ImageParam.xy)) + localPixel;
     if (dstPixel.x < 0 || dstPixel.y < 0 ||
         dstPixel.x >= (int)OutputSize.x || dstPixel.y >= (int)OutputSize.y)
     {

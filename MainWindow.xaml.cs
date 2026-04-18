@@ -3,39 +3,47 @@ using Microsoft.Win32;
 using System;
 using System.Collections.Generic;
 using System.Globalization;
+using System.IO;
+using System.Threading;
+using System.Threading.Tasks;
 using System.Windows;
 using System.Windows.Interop;
+using System.Windows.Threading;
 using Vortice.Direct3D11;
 
 namespace GPUStitch
 {
     /// <summary>
-    /// 主窗口：D3D11Image 渲染管线
-    /// 
-    /// 核心流程（参考官方 WPFDXInterop C++ 示例 D3DVisualization）：
-    /// 1. Window_Loaded → 创建自己的 D3D11 设备 + 设置 D3D11Image 回调
-    /// 2. D3D11Image OnRender → surface 是共享纹理 → 通过 SharedHandle 在我们设备上打开
-    /// 3. 加载图片 → 在我们的设备上创建 GPU 纹理（与共享纹理同设备）
-    /// 4. CopyResource 写入共享纹理 → Flush → D3D11Image 显示到 WPF
-    /// 
-    /// 关键设计：我们的设备与 D3D11Image 内部设备是两个不同实例，
-    /// 但通过 DXGI SharedHandle 共享同一块 GPU 显存，避免跨设备错误。
+    /// 主窗口：负责图片导入、渐进预览、最终配准与 D3D11Image 显示。
     /// </summary>
     public partial class MainWindow : Window
     {
         private const int MaxPreviewTextureSize = 8192;
+        private const long MaxPreviewCanvasBytes = 384L * 1024L * 1024L;
+        private const long SourceTextureBudgetBytes = 512L * 1024L * 1024L;
+        private const int MaxPerImagePreviewDimension = 3072;
+        private const int MaxParallelLoads = 2;
 
         private D3DDeviceManager? _deviceManager;
         private GpuImageLoader? _imageLoader;
         private GpuStitcher? _stitcher;
         private GpuRegistration? _registration;
-        private readonly List<GpuImage> _loadedImages = new List<GpuImage>();
 
-        /// <summary>GPU 是否已初始化</summary>
-        private bool _gpuInitialized = false;
+        private readonly List<ImageFileMetadata> _loadedMetadata = new List<ImageFileMetadata>();
+        private readonly List<GpuImage?> _imageSlots = new List<GpuImage?>();
+        private readonly List<GridImageCoordinate?> _metadataCoordinates = new List<GridImageCoordinate?>();
+        private readonly Dictionary<GridImageCoordinate, int> _indexByCoordinate =
+            new Dictionary<GridImageCoordinate, int>();
 
-        /// <summary>在我们设备上打开的共享渲染目标（缓存，isNewSurface 时重建）</summary>
+        private ImageLoadPlan _currentLoadPlan = new ImageLoadPlan();
+        private CancellationTokenSource? _loadCts;
+        private bool _isLoading;
+
+        private bool _gpuInitialized;
         private ID3D11Texture2D? _sharedRenderTarget;
+
+        private readonly HashSet<int> _accumulatedIndices = new HashSet<int>();
+        private bool _canvasPrepared;
 
         private RenderMode _renderMode = RenderMode.None;
         private List<ImagePlacement> _currentPlacements = new List<ImagePlacement>();
@@ -52,15 +60,10 @@ namespace GPUStitch
                 TxtOverlapValue.Text = ((int)SliderOverlap.Value).ToString();
         }
 
-        /// <summary>
-        /// 窗口加载：创建自己的 D3D11 设备，然后设置 D3D11Image 回调。
-        /// 设备创建不依赖 surface，可以在此处立即完成。
-        /// </summary>
         private void Window_Loaded(object sender, RoutedEventArgs e)
         {
             try
             {
-                // 创建自己的 D3D11 设备（与 D3D11Image 无关，独立的硬件设备）
                 _deviceManager = new D3DDeviceManager();
                 _deviceManager.Initialize();
 
@@ -72,27 +75,30 @@ namespace GPUStitch
 
                 _gpuInitialized = true;
 
-                // 设置 D3D11Image 回调
                 var hwnd = new WindowInteropHelper(this).Handle;
                 InteropImage.WindowOwner = hwnd;
                 InteropImage.OnRender = RenderFrame;
 
-                //// 设置初始尺寸并触发首次渲染
-                //InteropImage.SetPixelSize(64, 64);
-                //InteropImage.RequestRender();
-
-                UpdateStatus("GPU 初始化成功，支持梯度配准 + GPU 拼图");
+                UpdateStatus("GPU 初始化成功，支持渐进式导入预览");
             }
             catch (Exception ex)
             {
-                MessageBox.Show($"GPU 初始化失败:\n{ex.Message}", "错误",
-                    MessageBoxButton.OK, MessageBoxImage.Error);
+                MessageBox.Show(
+                    $"GPU 初始化失败:\n{ex.Message}",
+                    "错误",
+                    MessageBoxButton.OK,
+                    MessageBoxImage.Error);
             }
         }
-        // ===== 按钮事件 =====
 
-        /// <summary>加载图片到 GPU</summary>
-        private void BtnLoadImages_Click(object sender, RoutedEventArgs e)
+        /// <summary>
+        /// 导入流程：
+        /// 1. 先探测元数据和预算；
+        /// 2. 先建立一个预览画布；
+        /// 3. 再异步把图像逐张贴进画布；
+        /// 4. 全部导入完毕后，用户可以再点击“配准 + GPU 拼图”做精配准。
+        /// </summary>
+        private async void BtnLoadImages_Click(object sender, RoutedEventArgs e)
         {
             if (!_gpuInitialized)
             {
@@ -112,29 +118,73 @@ namespace GPUStitch
 
             try
             {
-                foreach (var filePath in dlg.FileNames)
-                {
-                    var gpuImage = _imageLoader!.LoadFromFile(filePath);
-                    gpuImage.FilePath = filePath;
-                    _loadedImages.Add(gpuImage);
-                }
+                CancelCurrentLoad();
 
-                BtnStitch.IsEnabled = _loadedImages.Count >= 2;
-                BtnRecommend.IsEnabled = _loadedImages.Count >= 2;
-                BtnShowSingle.IsEnabled = _loadedImages.Count >= 1;
-                ApplyRecommendedParameters(showStatus: true);
+                SetLoadingUiState(isLoading: true);
+                UpdateStatus("正在分析图片元数据...");
+
+                var combinedMetadata = await Task.Run(() => BuildCombinedMetadata(dlg.FileNames));
+                SortMetadataForStreaming(combinedMetadata);
+
+                var loadPlan = ImageLoadPlanner.Build(
+                    combinedMetadata,
+                    SourceTextureBudgetBytes,
+                    MaxPerImagePreviewDimension);
+
+                PrepareProgressivePreview(combinedMetadata, loadPlan);
+
+                _loadCts = new CancellationTokenSource();
+                await LoadImagesProgressivelyAsync(combinedMetadata, loadPlan, _loadCts.Token);
+
+                if (_loadCts.IsCancellationRequested)
+                    return;
+
+                ApplyRecommendedParameters(showStatus: false);
+                BtnStitch.IsEnabled = GetLoadedImagesInOrder().Count >= 2;
+                BtnRecommend.IsEnabled = GetLoadedImagesInOrder().Count >= 2;
+                BtnShowSingle.IsEnabled = GetLoadedImagesInOrder().Count >= 1;
+
+                string sourceUsage = FormatMiB(loadPlan.PlannedSourceBytes);
+                string sourceRaw = FormatMiB(loadPlan.RawSourceBytes);
+                string scaleSuffix = loadPlan.IsDownsampled
+                    ? $"，按 {loadPlan.Scale:F3}x 预算缩放"
+                    : string.Empty;
+
+                UpdateStatus(
+                    $"导入完成：{GetLoadedCount()}/{_loadedMetadata.Count} 张{scaleSuffix}，源纹理预算 {sourceUsage}/{sourceRaw}");
+            }
+            catch (OperationCanceledException)
+            {
+                UpdateStatus("已取消导入");
             }
             catch (Exception ex)
             {
-                MessageBox.Show($"图片加载失败:\n{ex.Message}", "错误",
-                    MessageBoxButton.OK, MessageBoxImage.Error);
+                MessageBox.Show(
+                    $"图片加载失败:\n{ex.Message}",
+                    "错误",
+                    MessageBoxButton.OK,
+                    MessageBoxImage.Error);
+            }
+            finally
+            {
+                SetLoadingUiState(isLoading: false);
             }
         }
 
-        /// <summary>GPU 配准后拼图</summary>
-        private void BtnStitch_Click(object sender, RoutedEventArgs e)
+        /// <summary>
+        /// 最终精配准。
+        /// 当前会基于“已经完成导入”的缩放图像做 GPU 配准，再刷新显示布局。
+        /// </summary>
+        private async void BtnStitch_Click(object sender, RoutedEventArgs e)
         {
-            if (_loadedImages.Count < 2)
+            if (_isLoading)
+            {
+                MessageBox.Show("当前仍在导入图片，请等待导入完成后再执行精配准。", "提示");
+                return;
+            }
+
+            var images = GetLoadedImagesInOrder();
+            if (images.Count < 2)
             {
                 MessageBox.Show("请至少加载 2 张图片", "提示");
                 return;
@@ -142,15 +192,19 @@ namespace GPUStitch
 
             try
             {
+                BtnStitch.IsEnabled = false;
+                BtnRecommend.IsEnabled = false;
+                BtnLoadImages.IsEnabled = false;
+                UpdateStatus("正在执行 GPU 配准...");
+
                 int overlapPixels = (int)SliderOverlap.Value;
                 float blendWidth = (float)SliderBlendWidth.Value;
 
                 var registrationOptions =
-                    RegistrationOptions.CreateForImages(_loadedImages, overlapPixels);
+                    RegistrationOptions.CreateForImages(images, overlapPixels);
 
-                var layout = _registration!.ComputeLayout(
-                    _loadedImages,
-                    registrationOptions);
+                var layout = await Task.Run(() =>
+                    _registration!.ComputeLayout(images, registrationOptions));
 
                 if (layout.CanvasWidth <= 0 || layout.CanvasHeight <= 0)
                 {
@@ -159,6 +213,7 @@ namespace GPUStitch
                 }
 
                 var preview = PreparePreviewLayout(layout, blendWidth);
+                ApplyFeatherHints(preview.Placements, preview.BlendWidth);
 
                 _stitcher!.BlendWidth = preview.BlendWidth;
                 _currentCanvasWidth = preview.CanvasWidth;
@@ -166,6 +221,8 @@ namespace GPUStitch
                 _currentPlacements = preview.Placements;
                 _renderMode = RenderMode.Stitch;
                 _sharedRenderTarget = null;
+                _canvasPrepared = false;
+                _accumulatedIndices.Clear();
 
                 InteropImage.SetPixelSize(preview.CanvasWidth, preview.CanvasHeight);
                 InteropImage.RequestRender();
@@ -174,6 +231,7 @@ namespace GPUStitch
                 string previewSuffix = preview.Scale < 0.999f
                     ? $", 预览缩放 {preview.Scale:F3}"
                     : string.Empty;
+
                 UpdateStatus(
                     $"配准并拼图完成: {layout.CanvasWidth}×{layout.CanvasHeight}, " +
                     $"平均分 {layout.AverageScore:F3}, 可信 {layout.ConfidentPairCount}/{layout.PairResults.Count}, " +
@@ -181,14 +239,30 @@ namespace GPUStitch
             }
             catch (Exception ex)
             {
-                MessageBox.Show($"GPU 配准/拼图失败:\n{ex.Message}", "错误",
-                    MessageBoxButton.OK, MessageBoxImage.Error);
+                MessageBox.Show(
+                    $"GPU 配准/拼图失败:\n{ex.Message}",
+                    "错误",
+                    MessageBoxButton.OK,
+                    MessageBoxImage.Error);
+            }
+            finally
+            {
+                SetLoadingUiState(isLoading: false);
+                BtnStitch.IsEnabled = GetLoadedImagesInOrder().Count >= 2;
+                BtnRecommend.IsEnabled = GetLoadedImagesInOrder().Count >= 2;
+                BtnLoadImages.IsEnabled = true;
             }
         }
 
         private void BtnRecommend_Click(object sender, RoutedEventArgs e)
         {
-            if (_loadedImages.Count < 2)
+            if (_isLoading)
+            {
+                MessageBox.Show("导入过程中暂不建议重新估计参数，请等待导入完成。", "提示");
+                return;
+            }
+
+            if (GetLoadedImagesInOrder().Count < 2)
             {
                 MessageBox.Show("请至少加载 2 张图片", "提示");
                 return;
@@ -197,10 +271,10 @@ namespace GPUStitch
             ApplyRecommendedParameters(showStatus: true);
         }
 
-        /// <summary>显示单张图片（验证渲染管线）</summary>
         private void BtnShowSingle_Click(object sender, RoutedEventArgs e)
         {
-            if (_loadedImages.Count == 0)
+            var image = GetFirstLoadedImage();
+            if (image == null)
             {
                 MessageBox.Show("请先加载图片", "提示");
                 return;
@@ -208,79 +282,65 @@ namespace GPUStitch
 
             try
             {
-                var img = _loadedImages[0];
-                _currentCanvasWidth = img.Width;
-                _currentCanvasHeight = img.Height;
+                _currentCanvasWidth = image.Width;
+                _currentCanvasHeight = image.Height;
                 _currentPlacements = new List<ImagePlacement>();
                 _renderMode = RenderMode.SingleImage;
                 _sharedRenderTarget = null;
+                _canvasPrepared = false;
+                _accumulatedIndices.Clear();
 
-                InteropImage.SetPixelSize(img.Width, img.Height);
+                InteropImage.SetPixelSize(image.Width, image.Height);
                 InteropImage.RequestRender();
 
-                UpdateStatus($"显示单图: {img.Width}×{img.Height} - {System.IO.Path.GetFileName(img.FilePath)}");
+                UpdateStatus($"显示单图: {image.Width}×{image.Height} - {Path.GetFileName(image.FilePath)}");
             }
             catch (Exception ex)
             {
-                MessageBox.Show($"显示失败:\n{ex.Message}", "错误",
-                    MessageBoxButton.OK, MessageBoxImage.Error);
+                MessageBox.Show(
+                    $"显示失败:\n{ex.Message}",
+                    "错误",
+                    MessageBoxButton.OK,
+                    MessageBoxImage.Error);
             }
         }
 
-        /// <summary>清除所有 GPU 图片</summary>
         private void BtnClear_Click(object sender, RoutedEventArgs e)
         {
-            foreach (var img in _loadedImages)
-                img.Dispose();
-            _loadedImages.Clear();
+            CancelCurrentLoad();
+            ClearAllImages();
 
             _renderMode = RenderMode.None;
+            _sharedRenderTarget = null;
             BtnStitch.IsEnabled = false;
             BtnRecommend.IsEnabled = false;
             BtnShowSingle.IsEnabled = false;
+            BtnLoadImages.IsEnabled = true;
             UpdateStatus("已清除所有图片");
         }
 
-        /// <summary>窗口关闭：按依赖顺序释放 GPU 资源</summary>
         private void Window_Closing(object? sender, System.ComponentModel.CancelEventArgs e)
         {
-            foreach (var img in _loadedImages)
-                img.Dispose();
-            _loadedImages.Clear();
+            CancelCurrentLoad();
+            ClearAllImages();
 
-            // 释放共享渲染目标（由 DeviceManager 管理的会在 Dispose 中释放）
             _sharedRenderTarget = null;
-
             _stitcher?.Dispose();
             _registration?.Dispose();
             _imageLoader?.Dispose();
             _deviceManager?.Dispose();
         }
-        // ===== 渲染回调（核心） =====
 
-        /// <summary>
-        /// D3D11Image 的渲染回调（在 WPF 渲染线程调用）
-        /// 
-        /// 官方模式（OpenSharedResource）：
-        /// 1. isNewSurface=true → 通过 SharedHandle 在我们设备上打开共享纹理
-        /// 2. CopyResource / Dispatch 写入共享纹理（全部操作在我们的设备上）
-        /// 3. Flush 确保 GPU 命令完成
-        /// 
-        /// 不直接操作 surface 指针（那是 D3D11Image 内部设备上的资源）。
-        /// </summary>
         private void RenderFrame(IntPtr surface, bool isNewSurface)
         {
             if (surface == IntPtr.Zero || !_gpuInitialized)
                 return;
 
-            // 没有内容要渲染时直接返回，不打开共享纹理
-            // （避免初始 64×64 空白渲染时触发不必要的 COM 调用）
             if (_renderMode == RenderMode.None)
                 return;
 
             try
             {
-                // 当 surface 变化时（首次 / 尺寸变化），重新打开共享纹理
                 if (isNewSurface ||
                     _sharedRenderTarget == null ||
                     _sharedRenderTarget.Description.Width != _currentCanvasWidth ||
@@ -295,21 +355,43 @@ namespace GPUStitch
                 switch (_renderMode)
                 {
                     case RenderMode.SingleImage:
-                        // 直接拷贝源纹理到共享渲染目标（尺寸必须匹配，通过 SetPixelSize 保证）
-                        _deviceManager!.Context.CopyResource(_sharedRenderTarget, _loadedImages[0].Texture);
+                    {
+                        var image = GetFirstLoadedImage();
+                        if (image != null)
+                        {
+                            _deviceManager!.Context.CopyResource(_sharedRenderTarget, image.Texture);
+                        }
                         break;
-
+                    }
                     case RenderMode.Stitch:
-                        _stitcher!.Stitch(
-                            _loadedImages,
-                            _currentPlacements,
-                            _currentCanvasWidth,
-                            _currentCanvasHeight,
-                            _sharedRenderTarget);
+                    {
+                        // 增量累加：仅处理尚未累加的新图像
+                        if (!_canvasPrepared)
+                        {
+                            _stitcher!.PrepareCanvas(_currentCanvasWidth, _currentCanvasHeight);
+                            _accumulatedIndices.Clear();
+                            _canvasPrepared = true;
+                        }
+
+                        int count = Math.Min(_imageSlots.Count, _currentPlacements.Count);
+                        for (int i = 0; i < count; i++)
+                        {
+                            if (_imageSlots[i] != null && !_accumulatedIndices.Contains(i))
+                            {
+                                _stitcher!.AccumulateImage(_imageSlots[i]!, _currentPlacements[i]);
+                                _accumulatedIndices.Add(i);
+                            }
+                        }
+
+                        if (_accumulatedIndices.Count > 0)
+                        {
+                            _stitcher!.FinalizeAndCopy(
+                                _currentCanvasWidth, _currentCanvasHeight, _sharedRenderTarget);
+                        }
                         break;
+                    }
                 }
 
-                // Flush 确保 GPU 命令执行完毕后 D3D11Image 才读取共享纹理
                 _deviceManager!.Context.Flush();
             }
             catch (Exception ex)
@@ -322,18 +404,402 @@ namespace GPUStitch
             }
         }
 
-        private void UpdateStatus(string message)
+        private async Task LoadImagesProgressivelyAsync(
+            IReadOnlyList<ImageFileMetadata> metadata,
+            ImageLoadPlan loadPlan,
+            CancellationToken cancellationToken)
         {
-            TxtStatus.Text = message;
+            var pending = new List<Task<LoadedImageResult>>();
+            int nextIndex = 0;
+
+            while (nextIndex < metadata.Count || pending.Count > 0)
+            {
+                while (pending.Count < MaxParallelLoads && nextIndex < metadata.Count)
+                {
+                    int index = nextIndex++;
+                    pending.Add(LoadSingleImageAsync(metadata[index], index, loadPlan.Scale, cancellationToken));
+                }
+
+                var finished = await Task.WhenAny(pending);
+                pending.Remove(finished);
+
+                LoadedImageResult result = await finished;
+                if (cancellationToken.IsCancellationRequested)
+                {
+                    result.Image.Dispose();
+                    break;
+                }
+
+                _imageSlots[result.Index] = result.Image;
+                int loadedCount = GetLoadedCount();
+
+                if (loadedCount == 1)
+                {
+                    _renderMode = RenderMode.Stitch;
+                    _sharedRenderTarget = null;
+                }
+
+                BtnShowSingle.IsEnabled = loadedCount >= 1;
+                InteropImage.RequestRender();
+
+                UpdateStatus(
+                    $"正在导入并贴图: {loadedCount}/{metadata.Count}，" +
+                    $"缩放 {loadPlan.Scale:F3}x");
+
+                await Dispatcher.Yield(DispatcherPriority.Background);
+            }
+        }
+
+        private Task<LoadedImageResult> LoadSingleImageAsync(
+            ImageFileMetadata metadata,
+            int index,
+            float scale,
+            CancellationToken cancellationToken)
+        {
+            return Task.Run(() =>
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+
+                var image = _imageLoader!.LoadFromFile(metadata.FilePath, scale);
+                image.FilePath = metadata.FilePath;
+
+                cancellationToken.ThrowIfCancellationRequested();
+                return new LoadedImageResult(index, image);
+            }, cancellationToken);
+        }
+
+        private List<ImageFileMetadata> BuildCombinedMetadata(IReadOnlyList<string> newFilePaths)
+        {
+            var combinedMetadata = new List<ImageFileMetadata>();
+            var seenPaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+            for (int i = 0; i < _loadedMetadata.Count; i++)
+            {
+                var item = _loadedMetadata[i];
+                if (seenPaths.Add(item.FilePath))
+                {
+                    combinedMetadata.Add(item);
+                }
+            }
+
+            for (int i = 0; i < newFilePaths.Count; i++)
+            {
+                string filePath = newFilePaths[i];
+                if (seenPaths.Add(filePath))
+                {
+                    combinedMetadata.Add(GpuImageLoader.ProbeFile(filePath));
+                }
+            }
+
+            return combinedMetadata;
+        }
+
+        private void SortMetadataForStreaming(List<ImageFileMetadata> metadata)
+        {
+            bool allGridNamed = true;
+            for (int i = 0; i < metadata.Count; i++)
+            {
+                if (!GridImageCoordinate.TryParseFromFilePath(metadata[i].FilePath, out _))
+                {
+                    allGridNamed = false;
+                    break;
+                }
+            }
+
+            if (!allGridNamed)
+                return;
+
+            metadata.Sort((left, right) =>
+            {
+                GridImageCoordinate.TryParseFromFilePath(left.FilePath, out var leftCoord);
+                GridImageCoordinate.TryParseFromFilePath(right.FilePath, out var rightCoord);
+
+                int rowCompare = leftCoord.Row.CompareTo(rightCoord.Row);
+                return rowCompare != 0
+                    ? rowCompare
+                    : leftCoord.Column.CompareTo(rightCoord.Column);
+            });
+        }
+
+        private void PrepareProgressivePreview(
+            IReadOnlyList<ImageFileMetadata> metadata,
+            ImageLoadPlan loadPlan)
+        {
+            ClearAllImages();
+
+            for (int i = 0; i < metadata.Count; i++)
+            {
+                _loadedMetadata.Add(metadata[i]);
+                _imageSlots.Add(null);
+
+                if (GridImageCoordinate.TryParseFromFilePath(metadata[i].FilePath, out var coordinate))
+                {
+                    _metadataCoordinates.Add(coordinate);
+                    _indexByCoordinate[coordinate] = i;
+                }
+                else
+                {
+                    _metadataCoordinates.Add(null);
+                }
+            }
+
+            _currentLoadPlan = loadPlan;
+
+            int overlapPixels = Math.Max(16, (int)SliderOverlap.Value);
+            float blendWidth = (float)SliderBlendWidth.Value;
+
+            var provisionalLayout = BuildProvisionalLayout(_loadedMetadata, loadPlan.Scale, overlapPixels);
+            var preview = PreparePreviewLayout(provisionalLayout, blendWidth);
+            ApplyFeatherHints(preview.Placements, preview.BlendWidth);
+
+            _stitcher!.BlendWidth = preview.BlendWidth;
+            _currentCanvasWidth = preview.CanvasWidth;
+            _currentCanvasHeight = preview.CanvasHeight;
+            _currentPlacements = preview.Placements;
+            _renderMode = RenderMode.None;
+            _sharedRenderTarget = null;
+            _canvasPrepared = false;
+            _accumulatedIndices.Clear();
+
+            InteropImage.SetPixelSize(preview.CanvasWidth, preview.CanvasHeight);
+            InteropImage.RequestRender();
+        }
+
+        private RegistrationLayout BuildProvisionalLayout(
+            IReadOnlyList<ImageFileMetadata> metadata,
+            float imageScale,
+            int overlapPixels)
+        {
+            if (TryBuildGridProvisionalLayout(metadata, imageScale, overlapPixels, out var gridLayout))
+                return gridLayout;
+
+            return BuildSequentialProvisionalLayout(metadata, imageScale, overlapPixels);
+        }
+
+        private bool TryBuildGridProvisionalLayout(
+            IReadOnlyList<ImageFileMetadata> metadata,
+            float imageScale,
+            int overlapPixels,
+            out RegistrationLayout layout)
+        {
+            layout = RegistrationLayout.Empty;
+
+            var rowHeights = new Dictionary<int, float>();
+            var columnWidths = new Dictionary<int, float>();
+            var rows = new SortedSet<int>();
+            var columns = new SortedSet<int>();
+            var coordinates = new GridImageCoordinate[metadata.Count];
+
+            for (int i = 0; i < metadata.Count; i++)
+            {
+                if (!GridImageCoordinate.TryParseFromFilePath(metadata[i].FilePath, out var coordinate))
+                    return false;
+
+                coordinates[i] = coordinate;
+                rows.Add(coordinate.Row);
+                columns.Add(coordinate.Column);
+
+                float width = Math.Max(1.0f, metadata[i].PixelWidth * imageScale);
+                float height = Math.Max(1.0f, metadata[i].PixelHeight * imageScale);
+
+                rowHeights[coordinate.Row] = rowHeights.TryGetValue(coordinate.Row, out float existingRow)
+                    ? Math.Max(existingRow, height)
+                    : height;
+
+                columnWidths[coordinate.Column] = columnWidths.TryGetValue(coordinate.Column, out float existingColumn)
+                    ? Math.Max(existingColumn, width)
+                    : width;
+            }
+
+            float scaledOverlap = Math.Max(1.0f, overlapPixels * imageScale);
+
+            var rowOffsets = new Dictionary<int, float>();
+            var columnOffsets = new Dictionary<int, float>();
+
+            float currentY = 0;
+            int? previousRow = null;
+            foreach (int row in rows)
+            {
+                if (previousRow.HasValue)
+                {
+                    currentY += Math.Max(1.0f, rowHeights[previousRow.Value] - scaledOverlap);
+                }
+
+                rowOffsets[row] = currentY;
+                previousRow = row;
+            }
+
+            float currentX = 0;
+            int? previousColumn = null;
+            foreach (int column in columns)
+            {
+                if (previousColumn.HasValue)
+                {
+                    currentX += Math.Max(1.0f, columnWidths[previousColumn.Value] - scaledOverlap);
+                }
+
+                columnOffsets[column] = currentX;
+                previousColumn = column;
+            }
+
+            var placements = new List<ImagePlacement>(metadata.Count);
+            float maxX = 0;
+            float maxY = 0;
+
+            for (int i = 0; i < metadata.Count; i++)
+            {
+                float width = Math.Max(1.0f, metadata[i].PixelWidth * imageScale);
+                float height = Math.Max(1.0f, metadata[i].PixelHeight * imageScale);
+                float offsetX = columnOffsets[coordinates[i].Column];
+                float offsetY = rowOffsets[coordinates[i].Row];
+
+                placements.Add(new ImagePlacement
+                {
+                    OffsetX = offsetX,
+                    OffsetY = offsetY,
+                    Width = width,
+                    Height = height,
+                });
+
+                maxX = Math.Max(maxX, offsetX + width);
+                maxY = Math.Max(maxY, offsetY + height);
+            }
+
+            layout = new RegistrationLayout(
+                placements,
+                (int)Math.Ceiling(maxX),
+                (int)Math.Ceiling(maxY),
+                new List<PairRegistrationResult>());
+
+            return true;
+        }
+
+        private static RegistrationLayout BuildSequentialProvisionalLayout(
+            IReadOnlyList<ImageFileMetadata> metadata,
+            float imageScale,
+            int overlapPixels)
+        {
+            var placements = new List<ImagePlacement>(metadata.Count);
+            float currentX = 0;
+            float maxHeight = 0;
+            float scaledOverlap = Math.Max(1.0f, overlapPixels * imageScale);
+
+            for (int i = 0; i < metadata.Count; i++)
+            {
+                float width = Math.Max(1.0f, metadata[i].PixelWidth * imageScale);
+                float height = Math.Max(1.0f, metadata[i].PixelHeight * imageScale);
+
+                placements.Add(new ImagePlacement
+                {
+                    OffsetX = currentX,
+                    OffsetY = 0,
+                    Width = width,
+                    Height = height,
+                });
+
+                currentX += Math.Max(1.0f, width - scaledOverlap);
+                maxHeight = Math.Max(maxHeight, height);
+            }
+
+            int canvasWidth = metadata.Count == 0
+                ? 0
+                : (int)Math.Ceiling(currentX + scaledOverlap);
+
+            return new RegistrationLayout(
+                placements,
+                canvasWidth,
+                (int)Math.Ceiling(maxHeight),
+                new List<PairRegistrationResult>());
+        }
+
+        private RenderSnapshot BuildRenderSnapshot()
+        {
+            var images = new List<GpuImage>();
+            var placements = new List<ImagePlacement>();
+
+            int count = Math.Min(_imageSlots.Count, _currentPlacements.Count);
+            bool hasGrid = _indexByCoordinate.Count == _loadedMetadata.Count && _loadedMetadata.Count > 0;
+
+            for (int i = 0; i < count; i++)
+            {
+                var image = _imageSlots[i];
+                if (image == null)
+                    continue;
+
+                var placement = _currentPlacements[i];
+
+                if (hasGrid && _metadataCoordinates[i].HasValue)
+                {
+                    var coordinate = _metadataCoordinates[i]!.Value;
+                    placement.FeatherLeft = IsImageLoadedAt(coordinate.Row, coordinate.Column - 1) ? placement.FeatherLeft : 0.0f;
+                    placement.FeatherRight = IsImageLoadedAt(coordinate.Row, coordinate.Column + 1) ? placement.FeatherRight : 0.0f;
+                    placement.FeatherTop = IsImageLoadedAt(coordinate.Row - 1, coordinate.Column) ? placement.FeatherTop : 0.0f;
+                    placement.FeatherBottom = IsImageLoadedAt(coordinate.Row + 1, coordinate.Column) ? placement.FeatherBottom : 0.0f;
+                }
+                else
+                {
+                    placement.FeatherLeft = i > 0 && _imageSlots[i - 1] != null ? placement.FeatherLeft : 0.0f;
+                    placement.FeatherRight = i < count - 1 && _imageSlots[i + 1] != null ? placement.FeatherRight : 0.0f;
+                    placement.FeatherTop = 0.0f;
+                    placement.FeatherBottom = 0.0f;
+                }
+
+                images.Add(image);
+                placements.Add(placement);
+            }
+
+            return new RenderSnapshot(images, placements);
+        }
+
+        private bool IsImageLoadedAt(int row, int column)
+        {
+            if (!_indexByCoordinate.TryGetValue(new GridImageCoordinate(row, column), out int index))
+                return false;
+
+            return index >= 0 && index < _imageSlots.Count && _imageSlots[index] != null;
+        }
+
+        private void ApplyFeatherHints(List<ImagePlacement> placements, float blendWidth)
+        {
+            if (placements.Count == 0 || blendWidth <= 0.0f)
+                return;
+
+            bool hasGrid = _indexByCoordinate.Count == _loadedMetadata.Count && _loadedMetadata.Count > 0;
+
+            for (int i = 0; i < placements.Count; i++)
+            {
+                var placement = placements[i];
+
+                if (hasGrid && _metadataCoordinates[i].HasValue)
+                {
+                    var coordinate = _metadataCoordinates[i]!.Value;
+                    placement.FeatherLeft = _indexByCoordinate.ContainsKey(new GridImageCoordinate(coordinate.Row, coordinate.Column - 1)) ? blendWidth : 0.0f;
+                    placement.FeatherRight = _indexByCoordinate.ContainsKey(new GridImageCoordinate(coordinate.Row, coordinate.Column + 1)) ? blendWidth : 0.0f;
+                    placement.FeatherTop = _indexByCoordinate.ContainsKey(new GridImageCoordinate(coordinate.Row - 1, coordinate.Column)) ? blendWidth : 0.0f;
+                    placement.FeatherBottom = _indexByCoordinate.ContainsKey(new GridImageCoordinate(coordinate.Row + 1, coordinate.Column)) ? blendWidth : 0.0f;
+                }
+                else
+                {
+                    placement.FeatherLeft = i > 0 ? blendWidth : 0.0f;
+                    placement.FeatherRight = i < placements.Count - 1 ? blendWidth : 0.0f;
+                    placement.FeatherTop = 0.0f;
+                    placement.FeatherBottom = 0.0f;
+                }
+
+                placements[i] = placement;
+            }
         }
 
         private void ApplyRecommendedParameters(bool showStatus)
         {
-            var recommendation = StitchParameterAdvisor.Recommend(_loadedImages);
+            var loadedImages = GetLoadedImagesInOrder();
+            var recommendation = StitchParameterAdvisor.Recommend(loadedImages);
             if (recommendation.OverlapPixels <= 0)
             {
                 if (showStatus)
-                    UpdateStatus($"已加载 {_loadedImages.Count} 张图片到 GPU，但未能得到有效推荐");
+                {
+                    UpdateStatus($"已加载 {loadedImages.Count} 张图片，但未能得到有效推荐");
+                }
                 return;
             }
 
@@ -351,9 +817,100 @@ namespace GPUStitch
             {
                 string confidence = recommendation.Confidence.ToString("F3", CultureInfo.InvariantCulture);
                 UpdateStatus(
-                    $"已加载 {_loadedImages.Count} 张图片，推荐参数：重叠 {recommendation.OverlapPixels}px，" +
+                    $"已加载 {loadedImages.Count} 张图片，推荐参数：重叠 {recommendation.OverlapPixels}px，" +
                     $"混合 {recommendation.BlendWidth}px，推荐置信 {confidence}，评估 {recommendation.EvaluatedPairCount} 对");
             }
+        }
+
+        private List<GpuImage> GetLoadedImagesInOrder()
+        {
+            var images = new List<GpuImage>();
+            for (int i = 0; i < _imageSlots.Count; i++)
+            {
+                if (_imageSlots[i] != null)
+                {
+                    images.Add(_imageSlots[i]!);
+                }
+            }
+            return images;
+        }
+
+        private GpuImage? GetFirstLoadedImage()
+        {
+            for (int i = 0; i < _imageSlots.Count; i++)
+            {
+                if (_imageSlots[i] != null)
+                    return _imageSlots[i];
+            }
+
+            return null;
+        }
+
+        private int GetLoadedCount()
+        {
+            int count = 0;
+            for (int i = 0; i < _imageSlots.Count; i++)
+            {
+                if (_imageSlots[i] != null)
+                    count++;
+            }
+
+            return count;
+        }
+
+        private void ClearAllImages()
+        {
+            for (int i = 0; i < _imageSlots.Count; i++)
+            {
+                _imageSlots[i]?.Dispose();
+            }
+
+            _imageSlots.Clear();
+            _loadedMetadata.Clear();
+            _metadataCoordinates.Clear();
+            _indexByCoordinate.Clear();
+            _currentLoadPlan = new ImageLoadPlan();
+            _currentPlacements = new List<ImagePlacement>();
+            _currentCanvasWidth = 0;
+            _currentCanvasHeight = 0;
+            _canvasPrepared = false;
+            _accumulatedIndices.Clear();
+        }
+
+        private void CancelCurrentLoad()
+        {
+            if (_loadCts == null)
+                return;
+
+            try
+            {
+                _loadCts.Cancel();
+            }
+            finally
+            {
+                _loadCts.Dispose();
+                _loadCts = null;
+                _isLoading = false;
+            }
+        }
+
+        private void SetLoadingUiState(bool isLoading)
+        {
+            _isLoading = isLoading;
+            BtnLoadImages.IsEnabled = !isLoading;
+            BtnStitch.IsEnabled = !isLoading && GetLoadedImagesInOrder().Count >= 2;
+            BtnRecommend.IsEnabled = !isLoading && GetLoadedImagesInOrder().Count >= 2;
+            BtnShowSingle.IsEnabled = GetLoadedImagesInOrder().Count >= 1;
+        }
+
+        private void UpdateStatus(string message)
+        {
+            TxtStatus.Text = message;
+        }
+
+        private static string FormatMiB(long bytes)
+        {
+            return $"{(bytes / 1024.0 / 1024.0):F1} MiB";
         }
 
         private static double ClampForSlider(double value, double min, double max)
@@ -369,43 +926,73 @@ namespace GPUStitch
             RegistrationLayout layout,
             float blendWidth)
         {
-            float scale = Math.Min(
+            float dimensionScale = Math.Min(
                 1.0f,
                 Math.Min(
                     MaxPreviewTextureSize / (float)layout.CanvasWidth,
                     MaxPreviewTextureSize / (float)layout.CanvasHeight));
 
+            double rawCanvasBytes = (double)layout.CanvasWidth * layout.CanvasHeight * 20.0;
+            float byteBudgetScale = 1.0f;
+            if (rawCanvasBytes > MaxPreviewCanvasBytes && rawCanvasBytes > 1.0)
+            {
+                byteBudgetScale = (float)Math.Sqrt(MaxPreviewCanvasBytes / rawCanvasBytes);
+            }
+
+            float scale = Math.Min(1.0f, Math.Min(dimensionScale, byteBudgetScale));
+
+            List<ImagePlacement> placements;
+            float scaledBlend;
+
             if (scale >= 0.999f)
             {
-                return new PreviewLayout(
-                    layout.CanvasWidth,
-                    layout.CanvasHeight,
-                    layout.Placements,
-                    blendWidth,
-                    1.0f);
+                scale = 1.0f;
+                placements = new List<ImagePlacement>(layout.Placements);
+                scaledBlend = blendWidth;
             }
-
-            var scaledPlacements = new List<ImagePlacement>(layout.Placements.Count);
-            for (int i = 0; i < layout.Placements.Count; i++)
+            else
             {
-                var placement = layout.Placements[i];
-                scaledPlacements.Add(new ImagePlacement
+                placements = new List<ImagePlacement>(layout.Placements.Count);
+                for (int i = 0; i < layout.Placements.Count; i++)
                 {
-                    OffsetX = placement.OffsetX * scale,
-                    OffsetY = placement.OffsetY * scale,
-                    Width = Math.Max(1.0f, placement.Width * scale),
-                    Height = Math.Max(1.0f, placement.Height * scale),
-                });
+                    var p = layout.Placements[i];
+                    placements.Add(new ImagePlacement
+                    {
+                        OffsetX = p.OffsetX * scale,
+                        OffsetY = p.OffsetY * scale,
+                        Width = p.Width * scale,
+                        Height = p.Height * scale,
+                        FeatherLeft = p.FeatherLeft * scale,
+                        FeatherRight = p.FeatherRight * scale,
+                        FeatherTop = p.FeatherTop * scale,
+                        FeatherBottom = p.FeatherBottom * scale,
+                    });
+                }
+                scaledBlend = Math.Max(1.0f, blendWidth * scale);
             }
 
-            int scaledWidth = Math.Max(1, (int)Math.Ceiling(layout.CanvasWidth * scale));
-            int scaledHeight = Math.Max(1, (int)Math.Ceiling(layout.CanvasHeight * scale));
-            float scaledBlend = Math.Max(1.0f, blendWidth * scale);
+            // 将偏移和尺寸四舍五入到整数像素，消除亚像素间隙导致的条纹
+            int canvasWidth = 0, canvasHeight = 0;
+            for (int i = 0; i < placements.Count; i++)
+            {
+                var p = placements[i];
+                p.OffsetX = (float)Math.Round(p.OffsetX);
+                p.OffsetY = (float)Math.Round(p.OffsetY);
+                p.Width = Math.Max(1.0f, (float)Math.Round(p.Width));
+                p.Height = Math.Max(1.0f, (float)Math.Round(p.Height));
+                placements[i] = p;
+
+                canvasWidth = Math.Max(canvasWidth, (int)(p.OffsetX + p.Width));
+                canvasHeight = Math.Max(canvasHeight, (int)(p.OffsetY + p.Height));
+            }
+
+            canvasWidth = Math.Max(1, canvasWidth);
+            canvasHeight = Math.Max(1, canvasHeight);
 
             return new PreviewLayout(
-                scaledWidth,
-                scaledHeight,
-                scaledPlacements,
+                canvasWidth,
+                canvasHeight,
+                placements,
                 scaledBlend,
                 scale);
         }
@@ -431,6 +1018,30 @@ namespace GPUStitch
             public List<ImagePlacement> Placements { get; }
             public float BlendWidth { get; }
             public float Scale { get; }
+        }
+
+        private sealed class LoadedImageResult
+        {
+            public LoadedImageResult(int index, GpuImage image)
+            {
+                Index = index;
+                Image = image;
+            }
+
+            public int Index { get; }
+            public GpuImage Image { get; }
+        }
+
+        private sealed class RenderSnapshot
+        {
+            public RenderSnapshot(List<GpuImage> images, List<ImagePlacement> placements)
+            {
+                Images = images;
+                Placements = placements;
+            }
+
+            public List<GpuImage> Images { get; }
+            public List<ImagePlacement> Placements { get; }
         }
 
         private enum RenderMode

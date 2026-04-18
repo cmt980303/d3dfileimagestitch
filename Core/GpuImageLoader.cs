@@ -34,6 +34,17 @@ namespace GPUStitch.Core
         /// </summary>
         public GpuImage LoadFromFile(string filePath)
         {
+            return LoadFromFile(filePath, scale: 1.0f);
+        }
+
+        /// <summary>
+        /// 按指定缩放比例加载图片到 GPU。
+        /// 该方法用于“大批量预览模式”：
+        /// - 先按预算统一算出一个缩放比例；
+        /// - 再以同一比例加载所有图片，避免显存/内存被一次性打爆。
+        /// </summary>
+        public GpuImage LoadFromFile(string filePath, float scale)
+        {
             if (!File.Exists(filePath))
                 throw new FileNotFoundException($"图片文件不存在: {filePath}");
 
@@ -42,6 +53,12 @@ namespace GPUStitch.Core
             bitmap.BeginInit();
             bitmap.UriSource = new Uri(filePath, UriKind.Absolute);
             bitmap.CacheOption = BitmapCacheOption.OnLoad;
+            if (scale > 0.0f && scale < 0.999f)
+            {
+                var metadata = ProbeFile(filePath);
+                int decodeWidth = Math.Max(1, (int)Math.Round(metadata.PixelWidth * scale));
+                bitmap.DecodePixelWidth = decodeWidth;
+            }
             bitmap.EndInit();
             bitmap.Freeze();
 
@@ -56,6 +73,25 @@ namespace GPUStitch.Core
             convertedBitmap.CopyPixels(pixels, stride, 0);
 
             return CreateTextureFromPixels(pixels, width, height, stride);
+        }
+
+        /// <summary>
+        /// 只读取图片元数据，不解码整图。
+        /// 用于预算阶段快速估算资源占用。
+        /// </summary>
+        public static ImageFileMetadata ProbeFile(string filePath)
+        {
+            if (!File.Exists(filePath))
+                throw new FileNotFoundException($"图片文件不存在: {filePath}");
+
+            using var stream = File.OpenRead(filePath);
+            var decoder = BitmapDecoder.Create(
+                stream,
+                BitmapCreateOptions.DelayCreation,
+                BitmapCacheOption.None);
+
+            var frame = decoder.Frames[0];
+            return new ImageFileMetadata(filePath, frame.PixelWidth, frame.PixelHeight);
         }
 
         /// <summary>
@@ -124,5 +160,24 @@ namespace GPUStitch.Core
             Texture?.Dispose();
             GC.SuppressFinalize(this);
         }
+    }
+
+    /// <summary>
+    /// 图片文件元数据。
+    /// 当前只保存预算所需的最小信息：路径、宽高和源图估算字节数。
+    /// </summary>
+    public sealed class ImageFileMetadata
+    {
+        public ImageFileMetadata(string filePath, int pixelWidth, int pixelHeight)
+        {
+            FilePath = filePath;
+            PixelWidth = pixelWidth;
+            PixelHeight = pixelHeight;
+        }
+
+        public string FilePath { get; }
+        public int PixelWidth { get; }
+        public int PixelHeight { get; }
+        public long EstimatedSourceBytes => (long)PixelWidth * PixelHeight * 4L;
     }
 }

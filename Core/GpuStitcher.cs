@@ -20,6 +20,10 @@ namespace GPUStitch.Core
         public float OffsetY;
         public float Width;
         public float Height;
+        public float FeatherLeft;
+        public float FeatherRight;
+        public float FeatherTop;
+        public float FeatherBottom;
     }
 
     /// <summary>
@@ -112,6 +116,36 @@ namespace GPUStitch.Core
                 AccumulateSingleImage(images[i], placements[i]);
             }
 
+            FinalizeOutput(canvasWidth, canvasHeight);
+            _deviceManager.Context.CopyResource(targetTexture, _outputTexture!);
+        }
+
+        /// <summary>
+        /// 为增量累加准备画布：创建/调整资源并清空累积纹理。
+        /// 在渐进式导入场景中，先调用此方法，再逐张调用 AccumulateImage。
+        /// </summary>
+        public void PrepareCanvas(int canvasWidth, int canvasHeight)
+        {
+            EnsureOutputResources(canvasWidth, canvasHeight);
+            ClearAccumulationTexture();
+        }
+
+        /// <summary>
+        /// 把单张图像累加到已有的累积纹理上，不清空也不归一化。
+        /// 用于渐进式导入场景：每加载一张图就调用一次。
+        /// </summary>
+        public void AccumulateImage(GpuImage image, ImagePlacement placement)
+        {
+            AccumulateSingleImage(image, placement);
+        }
+
+        /// <summary>
+        /// 将当前累积结果归一化并拷贝到目标纹理。
+        /// 可在每次 AccumulateImage 后调用以刷新显示。
+        /// </summary>
+        public void FinalizeAndCopy(
+            int canvasWidth, int canvasHeight, ID3D11Texture2D targetTexture)
+        {
             FinalizeOutput(canvasWidth, canvasHeight);
             _deviceManager.Context.CopyResource(targetTexture, _outputTexture!);
         }
@@ -288,6 +322,11 @@ namespace GPUStitch.Core
             var constants = new StitchImageConstants
             {
                 ImageParam = new Float4(placement.OffsetX, placement.OffsetY, placement.Width, placement.Height),
+                FeatherParam = new Float4(
+                    placement.FeatherLeft,
+                    placement.FeatherRight,
+                    placement.FeatherTop,
+                    placement.FeatherBottom),
                 OutputWidth = _outputWidth,
                 OutputHeight = _outputHeight,
                 BlendWidth = BlendWidth,
@@ -342,6 +381,7 @@ namespace GPUStitch.Core
     public struct StitchImageConstants
     {
         public Float4 ImageParam;
+        public Float4 FeatherParam;
         public float OutputWidth;
         public float OutputHeight;
         public float BlendWidth;
