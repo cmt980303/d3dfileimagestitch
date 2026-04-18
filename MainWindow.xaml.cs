@@ -140,14 +140,6 @@ namespace GPUStitch
                 return;
             }
 
-            if (_loadedImages.Count > GpuStitcher.MaxInputImages)
-            {
-                MessageBox.Show(
-                    $"当前演示版本最多一次拼接 {GpuStitcher.MaxInputImages} 张图片，请先减少图片数量。",
-                    "提示");
-                return;
-            }
-
             try
             {
                 int overlapPixels = (int)SliderOverlap.Value;
@@ -156,7 +148,7 @@ namespace GPUStitch
                 var registrationOptions =
                     RegistrationOptions.CreateForImages(_loadedImages, overlapPixels);
 
-                var layout = _registration!.ComputeHorizontalLayout(
+                var layout = _registration!.ComputeLayout(
                     _loadedImages,
                     registrationOptions);
 

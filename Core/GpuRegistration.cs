@@ -11,8 +11,16 @@ namespace GPUStitch.Core
 {
     /// <summary>
     /// GPU 配准器。
-    /// 针对定拍模式，利用已知重叠区域，只在局部窗口内搜索相邻图像的精确偏移。
-    /// 为了兼顾轻度模糊与亮度漂移，评分使用梯度归一化相关，而不是直接比灰度值。
+    ///
+    /// 这个类专门负责“求相邻图片之间的相对位移”，不负责最终渲染。
+    /// 当前版本支持两种使用方式：
+    /// 1. 如果文件名能解析出行列号，则按二维网格布局做水平/垂直邻接配准；
+    /// 2. 如果无法解析命名规则，则退回到按输入顺序的单行拼接。
+    ///
+    /// 配准评分本身在 GPU 上完成，使用“零均值亮度相关 + 梯度相关”的混合策略：
+    /// - 亮度相关在严重模糊时更稳；
+    /// - 梯度相关在亮度漂移时更稳；
+    /// - 混合后对显微/工业图像会更耐受。
     /// </summary>
     public sealed class GpuRegistration : IDisposable
     {
@@ -34,13 +42,22 @@ namespace GPUStitch.Core
             _deviceManager = deviceManager;
         }
 
+        /// <summary>
+        /// 初始化配准器的 GPU 资源。
+        /// 只需要在程序启动后执行一次。
+        /// </summary>
         public void Initialize()
         {
             CompileShader();
             CreateConstantBuffer();
         }
 
-        public RegistrationLayout ComputeHorizontalLayout(
+        /// <summary>
+        /// 根据输入图片生成全局布局。
+        /// 若文件名符合“前三位行、后三位列”的约定，则优先构建二维网格布局；
+        /// 否则回退到单行连续布局。
+        /// </summary>
+        public RegistrationLayout ComputeLayout(
             IReadOnlyList<GpuImage> images,
             RegistrationOptions options)
         {
@@ -51,6 +68,117 @@ namespace GPUStitch.Core
             if (images.Count == 0)
                 return RegistrationLayout.Empty;
 
+            if (TryComputeGridLayout(images, options, out var gridLayout))
+                return gridLayout;
+
+            return ComputeSequentialHorizontalLayout(images, options);
+        }
+
+        /// <summary>
+        /// 对一对相邻图片做 GPU 配准。
+        /// axis=Horizontal 时表示“左 -> 右”；
+        /// axis=Vertical 时表示“上 -> 下”。
+        /// </summary>
+        public PairRegistrationResult RegisterPair(
+            GpuImage first,
+            GpuImage second,
+            RegistrationOptions options,
+            RegistrationAxis axis,
+            int sourceIndex,
+            int targetIndex)
+        {
+            if (first == null)
+                throw new ArgumentNullException(nameof(first));
+            if (second == null)
+                throw new ArgumentNullException(nameof(second));
+            if (options == null)
+                throw new ArgumentNullException(nameof(options));
+
+            int overlapSize = axis == RegistrationAxis.Horizontal
+                ? Clamp(options.ExpectedHorizontalOverlap, 8, Math.Min(first.Width, second.Width) - 2)
+                : Clamp(options.ExpectedVerticalOverlap, 8, Math.Min(first.Height, second.Height) - 2);
+
+            int candidateCountX = options.SearchRangeX * 2 + 1;
+            int candidateCountY = options.SearchRangeY * 2 + 1;
+
+            EnsureScoreTextures(candidateCountX, candidateCountY);
+            UpdateConstants(first, second, overlapSize, options, axis);
+
+            var ctx = _deviceManager.Context;
+            ctx.CSSetShader(_computeShader);
+            ctx.CSSetConstantBuffer(0, _constantBuffer);
+            ctx.CSSetShaderResources(0, new[]
+            {
+                first.ShaderResourceView,
+                second.ShaderResourceView,
+            });
+            ctx.CSSetUnorderedAccessView(0, _scoreUav);
+
+            ctx.Dispatch(
+                (candidateCountX + 7) / 8,
+                (candidateCountY + 7) / 8,
+                1);
+
+            ctx.CSSetShaderResources(0, new ID3D11ShaderResourceView[2]);
+            ctx.CSSetUnorderedAccessView(0, (ID3D11UnorderedAccessView?)null);
+
+            ctx.CopyResource(_scoreReadbackTexture!, _scoreTexture!);
+            ctx.Flush();
+
+            var best = ReadBestScore(candidateCountX, candidateCountY);
+
+            int relativeOffsetX;
+            int relativeOffsetY;
+
+            if (axis == RegistrationAxis.Horizontal)
+            {
+                int baseShiftX = Math.Max(1, first.Width - overlapSize);
+                relativeOffsetX = baseShiftX - best.BestDeltaX;
+                relativeOffsetY = -best.BestDeltaY;
+            }
+            else
+            {
+                int baseShiftY = Math.Max(1, first.Height - overlapSize);
+                relativeOffsetX = -best.BestDeltaX;
+                relativeOffsetY = baseShiftY - best.BestDeltaY;
+            }
+
+            bool isConfident = best.Score >= options.ConfidenceThreshold;
+            if (!isConfident)
+            {
+                if (axis == RegistrationAxis.Horizontal)
+                {
+                    relativeOffsetX = Math.Max(1, first.Width - overlapSize);
+                    relativeOffsetY = 0;
+                }
+                else
+                {
+                    relativeOffsetX = 0;
+                    relativeOffsetY = Math.Max(1, first.Height - overlapSize);
+                }
+            }
+
+            return new PairRegistrationResult(
+                sourceIndex,
+                targetIndex,
+                axis,
+                best.BestDeltaX,
+                best.BestDeltaY,
+                best.Score,
+                overlapSize,
+                relativeOffsetX,
+                relativeOffsetY,
+                isConfident);
+        }
+
+        /// <summary>
+        /// 退化场景：如果没有行列命名信息，则把输入图片按顺序视作单行。
+        /// 这条路径兼容之前已有的使用方式。
+        /// </summary>
+        private RegistrationLayout ComputeSequentialHorizontalLayout(
+            IReadOnlyList<GpuImage> images,
+            RegistrationOptions options)
+        {
             if (images.Count == 1)
             {
                 var only = images[0];
@@ -70,126 +198,241 @@ namespace GPUStitch.Core
                     new List<PairRegistrationResult>());
             }
 
-            var placements = new List<ImagePlacement>(images.Count)
-            {
-                new ImagePlacement
-                {
-                    OffsetX = 0,
-                    OffsetY = 0,
-                    Width = images[0].Width,
-                    Height = images[0].Height,
-                }
-            };
-
+            var positionsX = new float[images.Count];
+            var positionsY = new float[images.Count];
             var pairResults = new List<PairRegistrationResult>(images.Count - 1);
 
-            float currentX = 0;
-            float currentY = 0;
+            for (int i = 1; i < images.Count; i++)
+            {
+                var result = RegisterPair(
+                    images[i - 1],
+                    images[i],
+                    options,
+                    RegistrationAxis.Horizontal,
+                    i - 1,
+                    i);
+
+                pairResults.Add(result);
+                positionsX[i] = positionsX[i - 1] + result.RelativeOffsetX;
+                positionsY[i] = positionsY[i - 1] + result.RelativeOffsetY;
+            }
+
+            return BuildLayoutFromPositions(images, positionsX, positionsY, pairResults);
+        }
+
+        /// <summary>
+        /// 根据文件名中的行列号构建二维网格。
+        ///
+        /// 策略：
+        /// 1. 为每张图解析出 (row, col)；
+        /// 2. 只对“右邻居”和“下邻居”做局部配准；
+        /// 3. 通过图遍历把局部位移传播成全局坐标；
+        /// 4. 若图不完全连通，则使用网格步长做保守初始化。
+        /// </summary>
+        private bool TryComputeGridLayout(
+            IReadOnlyList<GpuImage> images,
+            RegistrationOptions options,
+            out RegistrationLayout layout)
+        {
+            layout = RegistrationLayout.Empty;
+
+            var coordinates = new GridImageCoordinate[images.Count];
+            var indexByCoordinate = new Dictionary<GridImageCoordinate, int>();
+            var sortedIndices = new List<int>(images.Count);
+
+            for (int i = 0; i < images.Count; i++)
+            {
+                if (!GridImageCoordinate.TryParseFromFilePath(images[i].FilePath, out var coordinate))
+                    return false;
+
+                if (indexByCoordinate.ContainsKey(coordinate))
+                    return false;
+
+                coordinates[i] = coordinate;
+                indexByCoordinate.Add(coordinate, i);
+                sortedIndices.Add(i);
+            }
+
+            sortedIndices.Sort((left, right) =>
+            {
+                int rowCompare = coordinates[left].Row.CompareTo(coordinates[right].Row);
+                return rowCompare != 0
+                    ? rowCompare
+                    : coordinates[left].Column.CompareTo(coordinates[right].Column);
+            });
+
+            var adjacency = new List<RegistrationEdge>[images.Count];
+            for (int i = 0; i < adjacency.Length; i++)
+            {
+                adjacency[i] = new List<RegistrationEdge>();
+            }
+
+            var pairResults = new List<PairRegistrationResult>();
+
+            for (int i = 0; i < sortedIndices.Count; i++)
+            {
+                int currentIndex = sortedIndices[i];
+                var currentCoordinate = coordinates[currentIndex];
+
+                var rightCoordinate = new GridImageCoordinate(currentCoordinate.Row, currentCoordinate.Column + 1);
+                if (indexByCoordinate.TryGetValue(rightCoordinate, out int rightIndex))
+                {
+                    var result = RegisterPair(
+                        images[currentIndex],
+                        images[rightIndex],
+                        options,
+                        RegistrationAxis.Horizontal,
+                        currentIndex,
+                        rightIndex);
+
+                    pairResults.Add(result);
+                    AddBidirectionalEdge(adjacency, currentIndex, rightIndex, result.RelativeOffsetX, result.RelativeOffsetY);
+                }
+
+                var bottomCoordinate = new GridImageCoordinate(currentCoordinate.Row + 1, currentCoordinate.Column);
+                if (indexByCoordinate.TryGetValue(bottomCoordinate, out int bottomIndex))
+                {
+                    var result = RegisterPair(
+                        images[currentIndex],
+                        images[bottomIndex],
+                        options,
+                        RegistrationAxis.Vertical,
+                        currentIndex,
+                        bottomIndex);
+
+                    pairResults.Add(result);
+                    AddBidirectionalEdge(adjacency, currentIndex, bottomIndex, result.RelativeOffsetX, result.RelativeOffsetY);
+                }
+            }
+
+            if (pairResults.Count == 0)
+                return false;
+
+            float nominalStepX = EstimateNominalHorizontalStep(images, options);
+            float nominalStepY = EstimateNominalVerticalStep(images, options);
+
+            var positionsX = new float[images.Count];
+            var positionsY = new float[images.Count];
+            var visited = new bool[images.Count];
+            var queue = new Queue<int>();
+            var anchorCoordinate = coordinates[sortedIndices[0]];
+
+            for (int i = 0; i < sortedIndices.Count; i++)
+            {
+                int seedIndex = sortedIndices[i];
+                if (visited[seedIndex])
+                    continue;
+
+                if (seedIndex == sortedIndices[0])
+                {
+                    positionsX[seedIndex] = 0;
+                    positionsY[seedIndex] = 0;
+                }
+                else
+                {
+                    var coordinate = coordinates[seedIndex];
+                    positionsX[seedIndex] = (coordinate.Column - anchorCoordinate.Column) * nominalStepX;
+                    positionsY[seedIndex] = (coordinate.Row - anchorCoordinate.Row) * nominalStepY;
+                }
+
+                visited[seedIndex] = true;
+                queue.Enqueue(seedIndex);
+
+                while (queue.Count > 0)
+                {
+                    int current = queue.Dequeue();
+                    var edges = adjacency[current];
+                    for (int edgeIndex = 0; edgeIndex < edges.Count; edgeIndex++)
+                    {
+                        var edge = edges[edgeIndex];
+                        if (visited[edge.Target])
+                            continue;
+
+                        positionsX[edge.Target] = positionsX[current] + edge.OffsetX;
+                        positionsY[edge.Target] = positionsY[current] + edge.OffsetY;
+                        visited[edge.Target] = true;
+                        queue.Enqueue(edge.Target);
+                    }
+                }
+            }
+
+            layout = BuildLayoutFromPositions(images, positionsX, positionsY, pairResults);
+            return true;
+        }
+
+        private static void AddBidirectionalEdge(
+            List<RegistrationEdge>[] adjacency,
+            int source,
+            int target,
+            float offsetX,
+            float offsetY)
+        {
+            adjacency[source].Add(new RegistrationEdge(target, offsetX, offsetY));
+            adjacency[target].Add(new RegistrationEdge(source, -offsetX, -offsetY));
+        }
+
+        private static float EstimateNominalHorizontalStep(
+            IReadOnlyList<GpuImage> images,
+            RegistrationOptions options)
+        {
+            int minWidth = images[0].Width;
+            for (int i = 1; i < images.Count; i++)
+            {
+                minWidth = Math.Min(minWidth, images[i].Width);
+            }
+
+            return Math.Max(1, minWidth - options.ExpectedHorizontalOverlap);
+        }
+
+        private static float EstimateNominalVerticalStep(
+            IReadOnlyList<GpuImage> images,
+            RegistrationOptions options)
+        {
+            int minHeight = images[0].Height;
+            for (int i = 1; i < images.Count; i++)
+            {
+                minHeight = Math.Min(minHeight, images[i].Height);
+            }
+
+            return Math.Max(1, minHeight - options.ExpectedVerticalOverlap);
+        }
+
+        private static RegistrationLayout BuildLayoutFromPositions(
+            IReadOnlyList<GpuImage> images,
+            float[] positionsX,
+            float[] positionsY,
+            List<PairRegistrationResult> pairResults)
+        {
+            float minX = 0;
             float minY = 0;
             float maxX = images[0].Width;
             float maxY = images[0].Height;
 
-            for (int i = 1; i < images.Count; i++)
+            for (int i = 0; i < images.Count; i++)
             {
-                var result = RegisterPair(images[i - 1], images[i], options);
-                pairResults.Add(result);
+                minX = Math.Min(minX, positionsX[i]);
+                minY = Math.Min(minY, positionsY[i]);
+                maxX = Math.Max(maxX, positionsX[i] + images[i].Width);
+                maxY = Math.Max(maxY, positionsY[i] + images[i].Height);
+            }
 
-                currentX += result.RelativeOffsetX;
-                currentY += result.RelativeOffsetY;
-
+            var placements = new List<ImagePlacement>(images.Count);
+            for (int i = 0; i < images.Count; i++)
+            {
                 placements.Add(new ImagePlacement
                 {
-                    OffsetX = currentX,
-                    OffsetY = currentY,
+                    OffsetX = positionsX[i] - minX,
+                    OffsetY = positionsY[i] - minY,
                     Width = images[i].Width,
                     Height = images[i].Height,
                 });
-
-                minY = Math.Min(minY, currentY);
-                maxX = Math.Max(maxX, currentX + images[i].Width);
-                maxY = Math.Max(maxY, currentY + images[i].Height);
-            }
-
-            if (minY < 0)
-            {
-                for (int i = 0; i < placements.Count; i++)
-                {
-                    var placement = placements[i];
-                    placement.OffsetY -= minY;
-                    placements[i] = placement;
-                }
             }
 
             return new RegistrationLayout(
                 placements,
-                (int)Math.Ceiling(maxX),
+                (int)Math.Ceiling(maxX - minX),
                 (int)Math.Ceiling(maxY - minY),
                 pairResults);
-        }
-
-        public PairRegistrationResult RegisterPair(
-            GpuImage left,
-            GpuImage right,
-            RegistrationOptions options)
-        {
-            if (left == null)
-                throw new ArgumentNullException(nameof(left));
-            if (right == null)
-                throw new ArgumentNullException(nameof(right));
-            if (options == null)
-                throw new ArgumentNullException(nameof(options));
-
-            int overlapWidth = Clamp(
-                options.ExpectedOverlap,
-                8,
-                Math.Min(left.Width, right.Width) - 2);
-
-            int candidateCountX = options.SearchRangeX * 2 + 1;
-            int candidateCountY = options.SearchRangeY * 2 + 1;
-            EnsureScoreTextures(candidateCountX, candidateCountY);
-            UpdateConstants(left, right, overlapWidth, options);
-
-            var ctx = _deviceManager.Context;
-            ctx.CSSetShader(_computeShader);
-            ctx.CSSetConstantBuffer(0, _constantBuffer);
-            ctx.CSSetShaderResources(0, new[]
-            {
-                left.ShaderResourceView,
-                right.ShaderResourceView,
-            });
-            ctx.CSSetUnorderedAccessView(0, _scoreUav);
-
-            ctx.Dispatch(
-                (candidateCountX + 7) / 8,
-                (candidateCountY + 7) / 8,
-                1);
-
-            ctx.CSSetShaderResources(0, new ID3D11ShaderResourceView[2]);
-            ctx.CSSetUnorderedAccessView(0, (ID3D11UnorderedAccessView?)null);
-
-            ctx.CopyResource(_scoreReadbackTexture!, _scoreTexture!);
-            ctx.Flush();
-
-            var best = ReadBestScore(candidateCountX, candidateCountY);
-            int baseShiftX = Math.Max(1, left.Width - overlapWidth);
-            int relativeOffsetX = baseShiftX - best.BestDeltaX;
-            int relativeOffsetY = -best.BestDeltaY;
-
-            bool isConfident = best.Score >= options.ConfidenceThreshold;
-            if (!isConfident)
-            {
-                relativeOffsetX = baseShiftX;
-                relativeOffsetY = 0;
-            }
-
-            return new PairRegistrationResult(
-                best.BestDeltaX,
-                best.BestDeltaY,
-                best.Score,
-                overlapWidth,
-                relativeOffsetX,
-                relativeOffsetY,
-                isConfident);
         }
 
         private void CompileShader()
@@ -271,23 +514,25 @@ namespace GPUStitch.Core
         }
 
         private void UpdateConstants(
-            GpuImage left,
-            GpuImage right,
-            int overlapWidth,
-            RegistrationOptions options)
+            GpuImage first,
+            GpuImage second,
+            int overlapSize,
+            RegistrationOptions options,
+            RegistrationAxis axis)
         {
             var constants = new RegistrationConstants
             {
-                LeftWidth = left.Width,
-                LeftHeight = left.Height,
-                RightWidth = right.Width,
-                RightHeight = right.Height,
-                OverlapWidth = overlapWidth,
+                FirstWidth = first.Width,
+                FirstHeight = first.Height,
+                SecondWidth = second.Width,
+                SecondHeight = second.Height,
+                OverlapSize = overlapSize,
                 SearchRangeX = options.SearchRangeX,
                 SearchRangeY = options.SearchRangeY,
                 SampleStep = options.SampleStep,
-                MinGradientEnergy = options.MinGradientEnergy,
+                Orientation = (int)axis,
                 MinSampleCount = options.MinSampleCount,
+                MinGradientEnergy = options.MinGradientEnergy,
                 MinLumaVariance = options.MinLumaVariance,
                 GradientWeight = options.GradientWeight,
                 LumaWeight = options.LumaWeight,
@@ -341,13 +586,10 @@ namespace GPUStitch.Core
         {
             if (max < min)
                 return min;
-
             if (value < min)
                 return min;
-
             if (value > max)
                 return max;
-
             return value;
         }
 
@@ -367,6 +609,10 @@ namespace GPUStitch.Core
             GC.SuppressFinalize(this);
         }
 
+        /// <summary>
+        /// GPU 搜索结果中得分最高的候选位移。
+        /// 这里只保存局部搜索空间中的最佳点，后续再换算成世界坐标位移。
+        /// </summary>
         private readonly struct BestScoreResult
         {
             public BestScoreResult(int bestDeltaX, int bestDeltaY, float score)
@@ -380,172 +626,23 @@ namespace GPUStitch.Core
             public int BestDeltaY { get; }
             public float Score { get; }
         }
-    }
 
-    public sealed class RegistrationOptions
-    {
-        public int ExpectedOverlap { get; set; } = 100;
-        public int SearchRangeX { get; set; } = 64;
-        public int SearchRangeY { get; set; } = 32;
-        public int SampleStep { get; set; } = 2;
-        public float MinGradientEnergy { get; set; } = 0.00015f;
-        public int MinSampleCount { get; set; } = 64;
-        public float MinLumaVariance { get; set; } = 0.00005f;
-        public float GradientWeight { get; set; } = 0.45f;
-        public float LumaWeight { get; set; } = 0.55f;
-        public float ConfidenceThreshold { get; set; } = 0.06f;
-
-        public static RegistrationOptions CreateForImages(
-            IReadOnlyList<GpuImage> images,
-            int expectedOverlap)
+        /// <summary>
+        /// 图遍历用的邻接边。
+        /// 它只表达“从当前图走到另一张图，需要加上的位移”。
+        /// </summary>
+        private readonly struct RegistrationEdge
         {
-            if (images == null || images.Count == 0)
-                return new RegistrationOptions { ExpectedOverlap = expectedOverlap };
-
-            int minWidth = images[0].Width;
-            int minHeight = images[0].Height;
-
-            for (int i = 1; i < images.Count; i++)
+            public RegistrationEdge(int target, float offsetX, float offsetY)
             {
-                minWidth = Math.Min(minWidth, images[i].Width);
-                minHeight = Math.Min(minHeight, images[i].Height);
+                Target = target;
+                OffsetX = offsetX;
+                OffsetY = offsetY;
             }
 
-            int searchRangeX = ClampStatic(expectedOverlap / 2, 16, 192);
-            int searchRangeY = ClampStatic(minHeight / 48, 6, 64);
-            int sampleStep = minWidth >= 3500 || minHeight >= 3500 ? 3 : 2;
-            int minSamples = sampleStep <= 2 ? 64 : 48;
-            float minGradientEnergy = sampleStep <= 2 ? 0.00015f : 0.00010f;
-            float minLumaVariance = sampleStep <= 2 ? 0.00005f : 0.00003f;
-
-            return new RegistrationOptions
-            {
-                ExpectedOverlap = expectedOverlap,
-                SearchRangeX = searchRangeX,
-                SearchRangeY = searchRangeY,
-                SampleStep = sampleStep,
-                MinSampleCount = minSamples,
-                MinGradientEnergy = minGradientEnergy,
-                MinLumaVariance = minLumaVariance,
-                GradientWeight = 0.40f,
-                LumaWeight = 0.60f,
-                ConfidenceThreshold = 0.03f,
-            };
+            public int Target { get; }
+            public float OffsetX { get; }
+            public float OffsetY { get; }
         }
-
-        private static int ClampStatic(int value, int min, int max)
-        {
-            if (value < min)
-                return min;
-            if (value > max)
-                return max;
-            return value;
-        }
-    }
-
-    public sealed class RegistrationLayout
-    {
-        public static readonly RegistrationLayout Empty =
-            new RegistrationLayout(new List<ImagePlacement>(), 0, 0, new List<PairRegistrationResult>());
-
-        public RegistrationLayout(
-            List<ImagePlacement> placements,
-            int canvasWidth,
-            int canvasHeight,
-            List<PairRegistrationResult> pairResults)
-        {
-            Placements = placements;
-            CanvasWidth = canvasWidth;
-            CanvasHeight = canvasHeight;
-            PairResults = pairResults;
-        }
-
-        public List<ImagePlacement> Placements { get; }
-        public int CanvasWidth { get; }
-        public int CanvasHeight { get; }
-        public List<PairRegistrationResult> PairResults { get; }
-
-        public int ConfidentPairCount
-        {
-            get
-            {
-                int count = 0;
-                for (int i = 0; i < PairResults.Count; i++)
-                {
-                    if (PairResults[i].IsConfident)
-                        count++;
-                }
-                return count;
-            }
-        }
-
-        public float AverageScore
-        {
-            get
-            {
-                if (PairResults.Count == 0)
-                    return 0;
-
-                float sum = 0;
-                for (int i = 0; i < PairResults.Count; i++)
-                {
-                    sum += PairResults[i].Score;
-                }
-                return sum / PairResults.Count;
-            }
-        }
-    }
-
-    public sealed class PairRegistrationResult
-    {
-        public PairRegistrationResult(
-            int bestDeltaX,
-            int bestDeltaY,
-            float score,
-            int overlapWidth,
-            int relativeOffsetX,
-            int relativeOffsetY,
-            bool isConfident)
-        {
-            BestDeltaX = bestDeltaX;
-            BestDeltaY = bestDeltaY;
-            Score = score;
-            OverlapWidth = overlapWidth;
-            RelativeOffsetX = relativeOffsetX;
-            RelativeOffsetY = relativeOffsetY;
-            IsConfident = isConfident;
-        }
-
-        public int BestDeltaX { get; }
-        public int BestDeltaY { get; }
-        public float Score { get; }
-        public int OverlapWidth { get; }
-        public int RelativeOffsetX { get; }
-        public int RelativeOffsetY { get; }
-        public bool IsConfident { get; }
-    }
-
-    [StructLayout(LayoutKind.Sequential)]
-    internal struct RegistrationConstants
-    {
-        public int LeftWidth;
-        public int LeftHeight;
-        public int RightWidth;
-        public int RightHeight;
-
-        public int OverlapWidth;
-        public int SearchRangeX;
-        public int SearchRangeY;
-        public int SampleStep;
-
-        public float MinGradientEnergy;
-        public int MinSampleCount;
-        public float MinLumaVariance;
-        public float GradientWeight;
-
-        public float LumaWeight;
-        public float Padding0;
-        public float Padding1;
-        public float Padding2;
     }
 }

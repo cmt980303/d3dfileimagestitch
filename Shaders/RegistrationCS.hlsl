@@ -1,43 +1,37 @@
 // ============================================================
-// RegistrationCS.hlsl - GPU hybrid correlation registration
+// RegistrationCS.hlsl - hybrid GPU registration
 // ============================================================
-// For stop-and-shoot stitching, stage motion already provides a
-// coarse overlap estimate. This shader only searches a local
-// window and scores each candidate shift by a hybrid of:
-// 1. zero-mean luminance correlation
-// 2. normalized gradient correlation
-// Gradient correlation is robust to illumination drift; luminance
-// correlation keeps working when images are heavily blurred.
+// This shader evaluates one candidate offset per thread and writes
+// the score into ScoreMap. It supports both horizontal neighbors
+// (left -> right) and vertical neighbors (top -> bottom).
 // ============================================================
 
-//
 cbuffer RegistrationParams : register(b0)
 {
-    int   LeftWidth;
-    int   LeftHeight;
-    int   RightWidth;
-    int   RightHeight;
+    int   FirstWidth;
+    int   FirstHeight;
+    int   SecondWidth;
+    int   SecondHeight;
 
-    int   OverlapWidth;
+    int   OverlapSize;
     int   SearchRangeX;
     int   SearchRangeY;
     int   SampleStep;
 
-    float MinGradientEnergy;
+    int   Orientation;       // 0 = horizontal, 1 = vertical
     int   MinSampleCount;
+    float MinGradientEnergy;
     float MinLumaVariance;
-    float GradientWeight;
 
+    float GradientWeight;
     float LumaWeight;
     float Padding0;
     float Padding1;
-    float Padding2;
 };
 
-Texture2D<float4> LeftImage  : register(t0);
-Texture2D<float4> RightImage : register(t1);
-
-RWTexture2D<float> ScoreMap : register(u0);
+Texture2D<float4> FirstImage  : register(t0);
+Texture2D<float4> SecondImage : register(t1);
+RWTexture2D<float> ScoreMap   : register(u0);
 
 float ToLuma(float4 color)
 {
@@ -51,15 +45,57 @@ float SampleLuma(Texture2D<float4> image, int2 pixel)
 
 float2 ComputeGradient(Texture2D<float4> image, int2 pixel)
 {
-    float gx =
-        SampleLuma(image, pixel + int2(1, 0)) -
-        SampleLuma(image, pixel + int2(-1, 0));
-
-    float gy =
-        SampleLuma(image, pixel + int2(0, 1)) -
-        SampleLuma(image, pixel + int2(0, -1));
-
+    float gx = SampleLuma(image, pixel + int2(1, 0)) - SampleLuma(image, pixel + int2(-1, 0));
+    float gy = SampleLuma(image, pixel + int2(0, 1)) - SampleLuma(image, pixel + int2(0, -1));
     return float2(gx, gy);
+}
+
+void ComputeOverlapBounds(
+    int deltaX,
+    int deltaY,
+    out int xStart,
+    out int xEnd,
+    out int yStart,
+    out int yEnd)
+{
+    if (Orientation == 0)
+    {
+        xStart = max(1, FirstWidth - OverlapSize);
+        xEnd = FirstWidth - 1;
+        yStart = max(1, -deltaY + 1);
+        yEnd = min(FirstHeight - 1, SecondHeight - deltaY - 1);
+    }
+    else
+    {
+        xStart = max(1, -deltaX + 1);
+        xEnd = min(FirstWidth - 1, SecondWidth - deltaX - 1);
+        yStart = max(1, FirstHeight - OverlapSize);
+        yEnd = FirstHeight - 1;
+    }
+}
+
+bool ComputeSecondPixel(
+    int firstX,
+    int firstY,
+    int deltaX,
+    int deltaY,
+    out int2 secondPixel)
+{
+    if (Orientation == 0)
+    {
+        secondPixel = int2(
+            firstX - (FirstWidth - OverlapSize) + deltaX,
+            firstY + deltaY);
+    }
+    else
+    {
+        secondPixel = int2(
+            firstX + deltaX,
+            firstY - (FirstHeight - OverlapSize) + deltaY);
+    }
+
+    return secondPixel.x > 0 && secondPixel.x < (SecondWidth - 1) &&
+           secondPixel.y > 0 && secondPixel.y < (SecondHeight - 1);
 }
 
 [numthreads(8, 8, 1)]
@@ -77,20 +113,21 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID)
     int deltaX = candidateX - SearchRangeX;
     int deltaY = candidateY - SearchRangeY;
 
-    int leftStartX = max(1, LeftWidth - OverlapWidth);
-    int leftEndX = LeftWidth - 1;
-    int yStart = max(1, -deltaY + 1);
-    int yEnd = min(LeftHeight - 1, RightHeight - deltaY - 1);
+    int xStart;
+    int xEnd;
+    int yStart;
+    int yEnd;
+    ComputeOverlapBounds(deltaX, deltaY, xStart, xEnd, yStart, yEnd);
 
     float sumDot = 0.0;
-    float sumLeft = 0.0;
-    float sumRight = 0.0;
+    float sumFirstGradient = 0.0;
+    float sumSecondGradient = 0.0;
     int gradientSampleCount = 0;
 
-    float sumLeftLuma = 0.0;
-    float sumRightLuma = 0.0;
-    float sumLeftLuma2 = 0.0;
-    float sumRightLuma2 = 0.0;
+    float sumFirstLuma = 0.0;
+    float sumSecondLuma = 0.0;
+    float sumFirstLuma2 = 0.0;
+    float sumSecondLuma2 = 0.0;
     float sumCrossLuma = 0.0;
     int lumaSampleCount = 0;
 
@@ -98,58 +135,58 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID)
     for (int y = yStart; y < yEnd; y += max(SampleStep, 1))
     {
         [loop]
-        for (int x = leftStartX; x < leftEndX; x += max(SampleStep, 1))
+        for (int x = xStart; x < xEnd; x += max(SampleStep, 1))
         {
-            int rightX = x - (LeftWidth - OverlapWidth) + deltaX;
-            int rightY = y + deltaY;
-
-            if (rightX <= 0 || rightX >= RightWidth - 1)
+            int2 secondPixel;
+            if (!ComputeSecondPixel(x, y, deltaX, deltaY, secondPixel))
                 continue;
 
-            float leftLuma = SampleLuma(LeftImage, int2(x, y));
-            float rightLuma = SampleLuma(RightImage, int2(rightX, rightY));
+            float firstLuma = SampleLuma(FirstImage, int2(x, y));
+            float secondLuma = SampleLuma(SecondImage, secondPixel);
 
-            sumLeftLuma += leftLuma;
-            sumRightLuma += rightLuma;
-            sumLeftLuma2 += leftLuma * leftLuma;
-            sumRightLuma2 += rightLuma * rightLuma;
-            sumCrossLuma += leftLuma * rightLuma;
+            sumFirstLuma += firstLuma;
+            sumSecondLuma += secondLuma;
+            sumFirstLuma2 += firstLuma * firstLuma;
+            sumSecondLuma2 += secondLuma * secondLuma;
+            sumCrossLuma += firstLuma * secondLuma;
             lumaSampleCount++;
 
-            float2 leftGradient = ComputeGradient(LeftImage, int2(x, y));
-            float2 rightGradient = ComputeGradient(RightImage, int2(rightX, rightY));
+            float2 firstGradient = ComputeGradient(FirstImage, int2(x, y));
+            float2 secondGradient = ComputeGradient(SecondImage, secondPixel);
 
-            float leftEnergy = dot(leftGradient, leftGradient);
-            float rightEnergy = dot(rightGradient, rightGradient);
+            float firstEnergy = dot(firstGradient, firstGradient);
+            float secondEnergy = dot(secondGradient, secondGradient);
 
-            if (leftEnergy < MinGradientEnergy || rightEnergy < MinGradientEnergy)
+            if (firstEnergy < MinGradientEnergy || secondEnergy < MinGradientEnergy)
                 continue;
 
-            sumDot += dot(leftGradient, rightGradient);
-            sumLeft += leftEnergy;
-            sumRight += rightEnergy;
+            sumDot += dot(firstGradient, secondGradient);
+            sumFirstGradient += firstEnergy;
+            sumSecondGradient += secondEnergy;
             gradientSampleCount++;
         }
     }
 
     float score = -1.0;
+
     float gradientScore = -2.0;
-    if (gradientSampleCount >= max(MinSampleCount / 2, 16) && sumLeft > 1e-6 && sumRight > 1e-6)
+    if (gradientSampleCount >= max(MinSampleCount / 2, 16) &&
+        sumFirstGradient > 1e-6 && sumSecondGradient > 1e-6)
     {
-        gradientScore = sumDot * rsqrt(sumLeft * sumRight);
+        gradientScore = sumDot * rsqrt(sumFirstGradient * sumSecondGradient);
     }
 
     float lumaScore = -2.0;
     if (lumaSampleCount >= MinSampleCount)
     {
         float sampleCountF = (float)lumaSampleCount;
-        float numerator = sumCrossLuma - ((sumLeftLuma * sumRightLuma) / sampleCountF);
-        float leftVariance = sumLeftLuma2 - ((sumLeftLuma * sumLeftLuma) / sampleCountF);
-        float rightVariance = sumRightLuma2 - ((sumRightLuma * sumRightLuma) / sampleCountF);
+        float numerator = sumCrossLuma - ((sumFirstLuma * sumSecondLuma) / sampleCountF);
+        float firstVariance = sumFirstLuma2 - ((sumFirstLuma * sumFirstLuma) / sampleCountF);
+        float secondVariance = sumSecondLuma2 - ((sumSecondLuma * sumSecondLuma) / sampleCountF);
 
-        if (leftVariance > MinLumaVariance && rightVariance > MinLumaVariance)
+        if (firstVariance > MinLumaVariance && secondVariance > MinLumaVariance)
         {
-            lumaScore = numerator * rsqrt(leftVariance * rightVariance);
+            lumaScore = numerator * rsqrt(firstVariance * secondVariance);
         }
     }
 

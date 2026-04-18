@@ -25,6 +25,10 @@ namespace GPUStitch.Core
             _deviceManager = deviceManager;
         }
 
+
+
+
+
         /// <summary>
         /// 从文件路径加载图片到 GPU 纹理
         /// </summary>

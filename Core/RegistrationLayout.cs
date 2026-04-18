@@ -1,0 +1,74 @@
+using System.Collections.Generic;
+
+namespace GPUStitch.Core
+{
+    /// <summary>
+    /// 全局拼图布局结果。
+    ///
+    /// 它同时包含：
+    /// - 每张图在大画布中的最终位置；
+    /// - 画布总尺寸；
+    /// - 所有局部配准边的结果，便于调试与状态展示。
+    /// </summary>
+    public sealed class RegistrationLayout
+    {
+        public static readonly RegistrationLayout Empty =
+            new RegistrationLayout(new List<ImagePlacement>(), 0, 0, new List<PairRegistrationResult>());
+
+        public RegistrationLayout(
+            List<ImagePlacement> placements,
+            int canvasWidth,
+            int canvasHeight,
+            List<PairRegistrationResult> pairResults)
+        {
+            Placements = placements;
+            CanvasWidth = canvasWidth;
+            CanvasHeight = canvasHeight;
+            PairResults = pairResults;
+        }
+
+        public List<ImagePlacement> Placements { get; }
+        public int CanvasWidth { get; }
+        public int CanvasHeight { get; }
+        public List<PairRegistrationResult> PairResults { get; }
+
+        /// <summary>
+        /// 达到置信阈值的配准边数量。
+        /// 该值越高，通常说明整体布局越依赖真实配准结果而非回退估计。
+        /// </summary>
+        public int ConfidentPairCount
+        {
+            get
+            {
+                int count = 0;
+                for (int i = 0; i < PairResults.Count; i++)
+                {
+                    if (PairResults[i].IsConfident)
+                        count++;
+                }
+                return count;
+            }
+        }
+
+        /// <summary>
+        /// 所有配准边的平均评分。
+        /// 当图像内容充足且顺序正确时，这个值通常会比较稳定地为正。
+        /// </summary>
+        public float AverageScore
+        {
+            get
+            {
+                if (PairResults.Count == 0)
+                    return 0;
+
+                float sum = 0;
+                for (int i = 0; i < PairResults.Count; i++)
+                {
+                    sum += PairResults[i].Score;
+                }
+
+                return sum / PairResults.Count;
+            }
+        }
+    }
+}
