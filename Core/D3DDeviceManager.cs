@@ -97,6 +97,9 @@ namespace GPUStitch.Core
             return _sharedRenderTarget;
         }
 
+        #region 先注释掉的内容
+
+        
         /// <summary>
         /// IDXGIResource::GetSharedHandle 的委托定义（COM StdCall 约定）
         /// vtable slot 8: IUnknown(3) + IDXGIObject(4) + IDXGIDeviceSubObject(1) = 8
@@ -137,7 +140,7 @@ namespace GPUStitch.Core
                 Marshal.Release(pDxgiResource);
             }
         }
-
+        #endregion
         public void Dispose()
         {
             if (_disposed) return;
