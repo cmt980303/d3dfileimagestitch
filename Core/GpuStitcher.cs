@@ -40,6 +40,8 @@ namespace GPUStitch.Core
     /// </summary>
     public class GpuStitcher : IDisposable
     {
+        public const int MaxInputImages = 16;
+
         private readonly D3DDeviceManager _deviceManager;
 
         // ===== Compute Shader 相关 =====
@@ -227,6 +229,8 @@ namespace GPUStitch.Core
         {
             if (images.Count == 0 || images.Count != placements.Count)
                 throw new ArgumentException("图片数量和位置数量必须一致且不为空");
+            if (images.Count > MaxInputImages)
+                throw new ArgumentException($"当前拼图器最多支持 {MaxInputImages} 张图片");
 
             var ctx = _deviceManager.Context;
 
@@ -248,8 +252,8 @@ namespace GPUStitch.Core
             ctx.CSSetSampler(0, _samplerState);
 
             // 绑定源图片的 SRV 到 slot 0~N（对应 HLSL 中的 register(t0)~register(tN)）
-            var srvs = new ID3D11ShaderResourceView[8];
-            for (int i = 0; i < Math.Min(images.Count, 8); i++)
+            var srvs = new ID3D11ShaderResourceView[MaxInputImages];
+            for (int i = 0; i < Math.Min(images.Count, MaxInputImages); i++)
             {
                 srvs[i] = images[i].ShaderResourceView;
             }
@@ -267,7 +271,7 @@ namespace GPUStitch.Core
 
             // ---------- 第五步：清理管线状态 ----------
             // 解绑 SRV 和 UAV，避免资源冲突
-            ctx.CSSetShaderResources(0, new ID3D11ShaderResourceView[8]);
+            ctx.CSSetShaderResources(0, new ID3D11ShaderResourceView[MaxInputImages]);
             ctx.CSSetUnorderedAccessView(0, (ID3D11UnorderedAccessView?)null);
 
             // ---------- 第六步：将拼接结果复制到目标共享纹理 ----------

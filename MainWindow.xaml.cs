@@ -2,6 +2,7 @@ using GPUStitch.Core;
 using Microsoft.Win32;
 using System;
 using System.Collections.Generic;
+using System.Globalization;
 using System.Windows;
 using System.Windows.Interop;
 using Vortice.Direct3D11;
@@ -22,9 +23,12 @@ namespace GPUStitch
     /// </summary>
     public partial class MainWindow : Window
     {
+        private const int MaxPreviewTextureSize = 8192;
+
         private D3DDeviceManager? _deviceManager;
         private GpuImageLoader? _imageLoader;
         private GpuStitcher? _stitcher;
+        private GpuRegistration? _registration;
         private readonly List<GpuImage> _loadedImages = new List<GpuImage>();
 
         /// <summary>GPU 是否已初始化</summary>
@@ -61,10 +65,10 @@ namespace GPUStitch
                 _deviceManager.Initialize();
 
                 _imageLoader = new GpuImageLoader(_deviceManager);
-
-                // [暂时禁用] 拼图器初始化（包含 HLSL 编译），先验证单图显示
-                // _stitcher = new GpuStitcher(_deviceManager);
-                // _stitcher.Initialize();
+                _stitcher = new GpuStitcher(_deviceManager);
+                _stitcher.Initialize();
+                _registration = new GpuRegistration(_deviceManager);
+                _registration.Initialize();
 
                 _gpuInitialized = true;
 
@@ -77,7 +81,7 @@ namespace GPUStitch
                 //InteropImage.SetPixelSize(64, 64);
                 //InteropImage.RequestRender();
 
-                UpdateStatus("GPU 初始化成功（自有设备 + SharedHandle 模式），就绪");
+                UpdateStatus("GPU 初始化成功，支持梯度配准 + GPU 拼图");
             }
             catch (Exception ex)
             {
@@ -116,8 +120,9 @@ namespace GPUStitch
                 }
 
                 BtnStitch.IsEnabled = _loadedImages.Count >= 2;
+                BtnRecommend.IsEnabled = _loadedImages.Count >= 2;
                 BtnShowSingle.IsEnabled = _loadedImages.Count >= 1;
-                UpdateStatus($"已加载 {_loadedImages.Count} 张图片到 GPU");
+                ApplyRecommendedParameters(showStatus: true);
             }
             catch (Exception ex)
             {
@@ -126,47 +131,78 @@ namespace GPUStitch
             }
         }
 
-        /// <summary>GPU 拼图（暂时禁用，待单图显示验证通过后启用）</summary>
+        /// <summary>GPU 配准后拼图</summary>
         private void BtnStitch_Click(object sender, RoutedEventArgs e)
         {
-            MessageBox.Show("GPU 拼图功能暂时禁用，请先验证单图显示是否正常", "提示");
-            // [暂时禁用] 拼图功能
-            // if (_loadedImages.Count < 2)
-            // {
-            //     MessageBox.Show("请至少加载 2 张图片", "提示");
-            //     return;
-            // }
-            //
-            // try
-            // {
-            //     int overlapPixels = (int)SliderOverlap.Value;
-            //     float blendWidth = (float)SliderBlendWidth.Value;
-            //
-            //     var (canvasWidth, canvasHeight, placements) =
-            //         GpuStitcher.ComputeHorizontalLayout(_loadedImages, overlapPixels);
-            //
-            //     if (canvasWidth <= 0 || canvasHeight <= 0)
-            //     {
-            //         MessageBox.Show("计算画布尺寸失败", "错误");
-            //         return;
-            //     }
-            //
-            //     _stitcher!.BlendWidth = blendWidth;
-            //     _currentCanvasWidth = canvasWidth;
-            //     _currentCanvasHeight = canvasHeight;
-            //     _currentPlacements = placements;
-            //     _renderMode = RenderMode.Stitch;
-            //
-            //     InteropImage.SetPixelSize(canvasWidth, canvasHeight);
-            //     InteropImage.RequestRender();
-            //
-            //     UpdateStatus($"拼图完成: {canvasWidth}×{canvasHeight}, {_loadedImages.Count} 张图片");
-            // }
-            // catch (Exception ex)
-            // {
-            //     MessageBox.Show($"GPU 拼图失败:\n{ex.Message}", "错误",
-            //         MessageBoxButton.OK, MessageBoxImage.Error);
-            // }
+            if (_loadedImages.Count < 2)
+            {
+                MessageBox.Show("请至少加载 2 张图片", "提示");
+                return;
+            }
+
+            if (_loadedImages.Count > GpuStitcher.MaxInputImages)
+            {
+                MessageBox.Show(
+                    $"当前演示版本最多一次拼接 {GpuStitcher.MaxInputImages} 张图片，请先减少图片数量。",
+                    "提示");
+                return;
+            }
+
+            try
+            {
+                int overlapPixels = (int)SliderOverlap.Value;
+                float blendWidth = (float)SliderBlendWidth.Value;
+
+                var registrationOptions =
+                    RegistrationOptions.CreateForImages(_loadedImages, overlapPixels);
+
+                var layout = _registration!.ComputeHorizontalLayout(
+                    _loadedImages,
+                    registrationOptions);
+
+                if (layout.CanvasWidth <= 0 || layout.CanvasHeight <= 0)
+                {
+                    MessageBox.Show("计算画布尺寸失败", "错误");
+                    return;
+                }
+
+                var preview = PreparePreviewLayout(layout, blendWidth);
+
+                _stitcher!.BlendWidth = preview.BlendWidth;
+                _currentCanvasWidth = preview.CanvasWidth;
+                _currentCanvasHeight = preview.CanvasHeight;
+                _currentPlacements = preview.Placements;
+                _renderMode = RenderMode.Stitch;
+                _sharedRenderTarget = null;
+
+                InteropImage.SetPixelSize(preview.CanvasWidth, preview.CanvasHeight);
+                InteropImage.RequestRender();
+
+                int fallbackPairs = layout.PairResults.Count - layout.ConfidentPairCount;
+                string previewSuffix = preview.Scale < 0.999f
+                    ? $", 预览缩放 {preview.Scale:F3}"
+                    : string.Empty;
+                UpdateStatus(
+                    $"配准并拼图完成: {layout.CanvasWidth}×{layout.CanvasHeight}, " +
+                    $"平均分 {layout.AverageScore:F3}, 可信 {layout.ConfidentPairCount}/{layout.PairResults.Count}, " +
+                    $"回退 {fallbackPairs} 对{previewSuffix}");
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show($"GPU 配准/拼图失败:\n{ex.Message}", "错误",
+                    MessageBoxButton.OK, MessageBoxImage.Error);
+            }
+        }
+
+        private void BtnRecommend_Click(object sender, RoutedEventArgs e)
+        {
+            if (_loadedImages.Count < 2)
+            {
+                MessageBox.Show("请至少加载 2 张图片", "提示");
+                return;
+            }
+
+            ApplyRecommendedParameters(showStatus: true);
         }
 
         /// <summary>显示单张图片（验证渲染管线）</summary>
@@ -185,6 +221,7 @@ namespace GPUStitch
                 _currentCanvasHeight = img.Height;
                 _currentPlacements = new List<ImagePlacement>();
                 _renderMode = RenderMode.SingleImage;
+                _sharedRenderTarget = null;
 
                 InteropImage.SetPixelSize(img.Width, img.Height);
                 InteropImage.RequestRender();
@@ -207,6 +244,7 @@ namespace GPUStitch
 
             _renderMode = RenderMode.None;
             BtnStitch.IsEnabled = false;
+            BtnRecommend.IsEnabled = false;
             BtnShowSingle.IsEnabled = false;
             UpdateStatus("已清除所有图片");
         }
@@ -222,6 +260,7 @@ namespace GPUStitch
             _sharedRenderTarget = null;
 
             _stitcher?.Dispose();
+            _registration?.Dispose();
             _imageLoader?.Dispose();
             _deviceManager?.Dispose();
         }
@@ -250,7 +289,10 @@ namespace GPUStitch
             try
             {
                 // 当 surface 变化时（首次 / 尺寸变化），重新打开共享纹理
-                if (isNewSurface)
+                if (isNewSurface ||
+                    _sharedRenderTarget == null ||
+                    _sharedRenderTarget.Description.Width != _currentCanvasWidth ||
+                    _sharedRenderTarget.Description.Height != _currentCanvasHeight)
                 {
                     _sharedRenderTarget = _deviceManager!.OpenSharedSurface(surface);
                 }
@@ -265,15 +307,14 @@ namespace GPUStitch
                         _deviceManager!.Context.CopyResource(_sharedRenderTarget, _loadedImages[0].Texture);
                         break;
 
-                    // [暂时禁用] GPU 拼图功能，待单图显示验证通过后启用
-                    // case RenderMode.Stitch:
-                    //     _stitcher!.Stitch(
-                    //         _loadedImages,
-                    //         _currentPlacements,
-                    //         _currentCanvasWidth,
-                    //         _currentCanvasHeight,
-                    //         _sharedRenderTarget);
-                    //     break;
+                    case RenderMode.Stitch:
+                        _stitcher!.Stitch(
+                            _loadedImages,
+                            _currentPlacements,
+                            _currentCanvasWidth,
+                            _currentCanvasHeight,
+                            _sharedRenderTarget);
+                        break;
                 }
 
                 // Flush 确保 GPU 命令执行完毕后 D3D11Image 才读取共享纹理
@@ -281,6 +322,10 @@ namespace GPUStitch
             }
             catch (Exception ex)
             {
+                Dispatcher.BeginInvoke(new Action(() =>
+                {
+                    UpdateStatus($"渲染失败: {ex.Message}");
+                }));
                 System.Diagnostics.Debug.WriteLine($"RenderFrame 异常: {ex.Message}");
             }
         }
@@ -288,6 +333,112 @@ namespace GPUStitch
         private void UpdateStatus(string message)
         {
             TxtStatus.Text = message;
+        }
+
+        private void ApplyRecommendedParameters(bool showStatus)
+        {
+            var recommendation = StitchParameterAdvisor.Recommend(_loadedImages);
+            if (recommendation.OverlapPixels <= 0)
+            {
+                if (showStatus)
+                    UpdateStatus($"已加载 {_loadedImages.Count} 张图片到 GPU，但未能得到有效推荐");
+                return;
+            }
+
+            SliderOverlap.Value = ClampForSlider(
+                recommendation.OverlapPixels,
+                SliderOverlap.Minimum,
+                SliderOverlap.Maximum);
+
+            SliderBlendWidth.Value = ClampForSlider(
+                recommendation.BlendWidth,
+                SliderBlendWidth.Minimum,
+                SliderBlendWidth.Maximum);
+
+            if (showStatus)
+            {
+                string confidence = recommendation.Confidence.ToString("F3", CultureInfo.InvariantCulture);
+                UpdateStatus(
+                    $"已加载 {_loadedImages.Count} 张图片，推荐参数：重叠 {recommendation.OverlapPixels}px，" +
+                    $"混合 {recommendation.BlendWidth}px，推荐置信 {confidence}，评估 {recommendation.EvaluatedPairCount} 对");
+            }
+        }
+
+        private static double ClampForSlider(double value, double min, double max)
+        {
+            if (value < min)
+                return min;
+            if (value > max)
+                return max;
+            return value;
+        }
+
+        private static PreviewLayout PreparePreviewLayout(
+            RegistrationLayout layout,
+            float blendWidth)
+        {
+            float scale = Math.Min(
+                1.0f,
+                Math.Min(
+                    MaxPreviewTextureSize / (float)layout.CanvasWidth,
+                    MaxPreviewTextureSize / (float)layout.CanvasHeight));
+
+            if (scale >= 0.999f)
+            {
+                return new PreviewLayout(
+                    layout.CanvasWidth,
+                    layout.CanvasHeight,
+                    layout.Placements,
+                    blendWidth,
+                    1.0f);
+            }
+
+            var scaledPlacements = new List<ImagePlacement>(layout.Placements.Count);
+            for (int i = 0; i < layout.Placements.Count; i++)
+            {
+                var placement = layout.Placements[i];
+                scaledPlacements.Add(new ImagePlacement
+                {
+                    OffsetX = placement.OffsetX * scale,
+                    OffsetY = placement.OffsetY * scale,
+                    Width = Math.Max(1.0f, placement.Width * scale),
+                    Height = Math.Max(1.0f, placement.Height * scale),
+                });
+            }
+
+            int scaledWidth = Math.Max(1, (int)Math.Ceiling(layout.CanvasWidth * scale));
+            int scaledHeight = Math.Max(1, (int)Math.Ceiling(layout.CanvasHeight * scale));
+            float scaledBlend = Math.Max(1.0f, blendWidth * scale);
+
+            return new PreviewLayout(
+                scaledWidth,
+                scaledHeight,
+                scaledPlacements,
+                scaledBlend,
+                scale);
+        }
+
+        private sealed class PreviewLayout
+        {
+            public PreviewLayout(
+                int canvasWidth,
+                int canvasHeight,
+                List<ImagePlacement> placements,
+                float blendWidth,
+                float scale)
+            {
+                CanvasWidth = canvasWidth;
+                CanvasHeight = canvasHeight;
+                Placements = placements;
+                BlendWidth = blendWidth;
+                Scale = scale;
+            }
+
+            public int CanvasWidth { get; }
+            public int CanvasHeight { get; }
+            public List<ImagePlacement> Placements { get; }
+            public float BlendWidth { get; }
+            public float Scale { get; }
         }
 
         private enum RenderMode

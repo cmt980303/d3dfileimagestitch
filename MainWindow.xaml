@@ -42,14 +42,19 @@
             <Button
                 x:Name="BtnStitch"
                 Click="BtnStitch_Click"
-                Content="🧩 GPU 拼图"
+                Content="🧭 配准 + GPU 拼图"
+                IsEnabled="False" />
+            <Button
+                x:Name="BtnRecommend"
+                Click="BtnRecommend_Click"
+                Content="✨ 智能推荐"
                 IsEnabled="False" />
             <!--  显示单张图片按钮  -->
             <Button
                 x:Name="BtnShowSingle"
                 Click="BtnShowSingle_Click"
                 Content="🖼️ 显示单图"
-                IsEnabled="True" />
+                IsEnabled="False" />
             <!--  清除按钮  -->
             <Button
                 x:Name="BtnClear"
@@ -68,7 +73,7 @@
                 Width="150"
                 Margin="4,0"
                 VerticalAlignment="Center"
-                Maximum="200"
+                Maximum="512"
                 Minimum="0"
                 ToolTip="控制拼接重叠区域的渐变过渡宽度（像素）"
                 Value="50" />
@@ -90,7 +95,7 @@
                 Width="150"
                 Margin="4,0"
                 VerticalAlignment="Center"
-                Maximum="500"
+                Maximum="2048"
                 Minimum="0"
                 ToolTip="相邻图片的水平重叠像素数"
                 Value="100" />

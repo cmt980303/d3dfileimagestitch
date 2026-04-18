@@ -14,7 +14,7 @@ cbuffer StitchParams : register(b0)
     float  BlendWidth;       // blend transition width in pixels
 };
 
-// Source textures (up to 8)
+// Source textures (up to 16)
 Texture2D<float4> SrcImage0 : register(t0);
 Texture2D<float4> SrcImage1 : register(t1);
 Texture2D<float4> SrcImage2 : register(t2);
@@ -23,6 +23,14 @@ Texture2D<float4> SrcImage4 : register(t4);
 Texture2D<float4> SrcImage5 : register(t5);
 Texture2D<float4> SrcImage6 : register(t6);
 Texture2D<float4> SrcImage7 : register(t7);
+Texture2D<float4> SrcImage8 : register(t8);
+Texture2D<float4> SrcImage9 : register(t9);
+Texture2D<float4> SrcImage10 : register(t10);
+Texture2D<float4> SrcImage11 : register(t11);
+Texture2D<float4> SrcImage12 : register(t12);
+Texture2D<float4> SrcImage13 : register(t13);
+Texture2D<float4> SrcImage14 : register(t14);
+Texture2D<float4> SrcImage15 : register(t15);
 
 // Output UAV
 RWTexture2D<float4> OutputTex : register(u0);
@@ -43,6 +51,14 @@ float4 SampleImage(int idx, float2 uv)
         case 5: return SrcImage5.SampleLevel(LinearSampler, uv, 0);
         case 6: return SrcImage6.SampleLevel(LinearSampler, uv, 0);
         case 7: return SrcImage7.SampleLevel(LinearSampler, uv, 0);
+        case 8: return SrcImage8.SampleLevel(LinearSampler, uv, 0);
+        case 9: return SrcImage9.SampleLevel(LinearSampler, uv, 0);
+        case 10: return SrcImage10.SampleLevel(LinearSampler, uv, 0);
+        case 11: return SrcImage11.SampleLevel(LinearSampler, uv, 0);
+        case 12: return SrcImage12.SampleLevel(LinearSampler, uv, 0);
+        case 13: return SrcImage13.SampleLevel(LinearSampler, uv, 0);
+        case 14: return SrcImage14.SampleLevel(LinearSampler, uv, 0);
+        case 15: return SrcImage15.SampleLevel(LinearSampler, uv, 0);
         default: return float4(0, 0, 0, 0);
     }
 }
@@ -74,7 +90,7 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID)
     float4 colorAccum = float4(0, 0, 0, 0);
     float  weightSum  = 0.0;
 
-    for (int i = 0; i < ImageCount && i < 8; i++)
+    for (int i = 0; i < ImageCount && i < 16; i++)
     {
         float offsetX = ImageParams[i].x;
         float offsetY = ImageParams[i].y;
