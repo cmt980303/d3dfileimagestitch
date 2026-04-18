@@ -1,30 +1,37 @@
 using System;
 using System.Collections.Generic;
+using GPUStitch.Models;
 
 namespace GPUStitch.Core
 {
     /// <summary>
-    /// 图片加载计划。
-    /// 用于在真正解码/上传前，先根据图片尺寸估算资源占用，
-    /// 决定是否需要统一降采样后再加载。
-    /// </summary>
-    public sealed class ImageLoadPlan
-    {
-        public float Scale { get; set; } = 1.0f;
-        public long RawSourceBytes { get; set; }
-        public long PlannedSourceBytes { get; set; }
-        public int ImageCount { get; set; }
-        public bool IsDownsampled => Scale < 0.999f;
-    }
-
-    /// <summary>
     /// 根据图片元数据为当前会话生成加载预算方案。
-    /// 当前只控制“源图纹理”预算，真正的输出画布预算在 UI 预览阶段单独控制。
+    ///
+    /// 这里解决的问题是：
+    /// “在不知道最终拼图画布多大之前，怎样先保证原始输入纹理不会把显存/内存吃爆？”
+    ///
+    /// 当前策略把预算拆成两层：
+    /// 1. 本类只控制源图纹理常驻预算；
+    /// 2. 预览画布预算由 MainWindow 中的 PreparePreviewLayout 单独控制。
+    ///
+    /// 这种拆分能让“输入资源规模”和“输出画布规模”分别收敛，调试时也更直观。
     /// </summary>
     public static class ImageLoadPlanner
     {
         private const int BytesPerSourcePixel = 4; // BGRA8
 
+        /// <summary>
+        /// 为一批图片生成统一加载比例。
+        ///
+        /// 算法要点：
+        /// 1. 先统计所有图片的原始估算字节数；
+        /// 2. 再根据单张图最大边长得到尺寸约束；
+        /// 3. 如果总字节超预算，则对面积按平方根缩放；
+        /// 4. 取所有约束中的最小比例作为最终 scale。
+        ///
+        /// 使用平方根的原因是：显存开销和像素面积近似成正比，
+        /// 若希望总字节缩放到某个比例，边长应按其平方根缩放。
+        /// </summary>
         public static ImageLoadPlan Build(
             IReadOnlyList<ImageFileMetadata> metadata,
             long sourceGpuBudgetBytes,
@@ -51,6 +58,7 @@ namespace GPUStitch.Core
 
             dimensionScale = Math.Min(1.0, dimensionScale);
 
+            // 面积预算换成边长预算时取平方根。
             double budgetScale = 1.0;
             if (rawBytes > sourceGpuBudgetBytes && rawBytes > 1)
             {
@@ -58,7 +66,8 @@ namespace GPUStitch.Core
             }
 
             double scale = Math.Min(1.0, Math.Min(dimensionScale, budgetScale));
-            scale = Math.Max(scale, 0.05); // 至少保留一个极小预览比例，避免退成 0
+            // 至少保留一个极小预览比例，保证系统仍能给出“能看见全局关系”的预览。
+            scale = Math.Max(scale, 0.05);
 
             long plannedBytes = (long)Math.Ceiling(rawBytes * scale * scale);
 

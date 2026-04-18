@@ -1,6 +1,6 @@
 using System.Collections.Generic;
 
-namespace GPUStitch.Core
+namespace GPUStitch.Models
 {
     /// <summary>
     /// 全局拼图布局结果。

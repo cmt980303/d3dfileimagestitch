@@ -1,4 +1,5 @@
 using GPUStitch.Core;
+using GPUStitch.Models;
 using Microsoft.Win32;
 using System;
 using System.Collections.Generic;
@@ -14,37 +15,78 @@ using Vortice.Direct3D11;
 namespace GPUStitch
 {
     /// <summary>
-    /// 主窗口：负责图片导入、渐进预览、最终配准与 D3D11Image 显示。
+    /// 应用程序主窗口。
+    ///
+    /// 这个类承担了“用户操作编排层”的角色，本身并不直接实现底层 GPU 算法，
+    /// 而是把若干核心模块组织成一条完整的工作流：
+    /// 1. 读取文件并探测元数据；
+    /// 2. 基于预算生成预览加载方案；
+    /// 3. 逐张异步加载图片并触发渐进式预览；
+    /// 4. 在用户需要时调用 GPU 配准器求全局布局；
+    /// 5. 再把布局交给 GPU 拼图器输出最终预览。
+    ///
+    /// 之所以把这些流程放在窗口层统一调度，是因为它们和 UI 状态、
+    /// 用户交互时机、D3D11Image 刷新节奏是强相关的。
     /// </summary>
     public partial class MainWindow : Window
     {
+        /// <summary>
+        /// 预览纹理单边最大尺寸。
+        /// 这是对 WPF/D3D 预览链路的保护值，避免在超大画布下直接申请过大的共享纹理。
+        /// </summary>
         private const int MaxPreviewTextureSize = 8192;
+
+        /// <summary>
+        /// 预览画布的估算字节预算。
+        /// 这里按“累积纹理 + 输出纹理 + 额外余量”做保守估算，所以不是简单的 4 字节/像素。
+        /// </summary>
         private const long MaxPreviewCanvasBytes = 384L * 1024L * 1024L;
+
+        /// <summary>
+        /// 源图纹理预算。
+        /// 它控制的是“导入后每张图片作为 GPU 纹理常驻”这一部分开销，而不是输出画布开销。
+        /// </summary>
         private const long SourceTextureBudgetBytes = 512L * 1024L * 1024L;
+
+        /// <summary>
+        /// 单张图片在预览模式下允许的最大边长。
+        /// 这个限制主要用于避免个别超大原图在预算还没超标前就把单张纹理撑得太大。
+        /// </summary>
         private const int MaxPerImagePreviewDimension = 3072;
+
+        /// <summary>
+        /// 同时并发解码/上传的图片数量。
+        /// 这里故意保持较低并发，目的是降低磁盘、CPU 解码和显存上传同时峰值。
+        /// </summary>
         private const int MaxParallelLoads = 2;
 
+        // ===== GPU 核心模块 =====
         private D3DDeviceManager? _deviceManager;
         private GpuImageLoader? _imageLoader;
         private GpuStitcher? _stitcher;
         private GpuRegistration? _registration;
 
+        // ===== 当前会话中的图片与索引状态 =====
         private readonly List<ImageFileMetadata> _loadedMetadata = new List<ImageFileMetadata>();
         private readonly List<GpuImage?> _imageSlots = new List<GpuImage?>();
         private readonly List<GridImageCoordinate?> _metadataCoordinates = new List<GridImageCoordinate?>();
         private readonly Dictionary<GridImageCoordinate, int> _indexByCoordinate =
             new Dictionary<GridImageCoordinate, int>();
 
+        // ===== 导入状态 =====
         private ImageLoadPlan _currentLoadPlan = new ImageLoadPlan();
         private CancellationTokenSource? _loadCts;
         private bool _isLoading;
 
+        // ===== D3D11Image 共享表面状态 =====
         private bool _gpuInitialized;
         private ID3D11Texture2D? _sharedRenderTarget;
 
+        // ===== 渐进式累加状态 =====
         private readonly HashSet<int> _accumulatedIndices = new HashSet<int>();
         private bool _canvasPrepared;
 
+        // ===== 当前显示内容的布局状态 =====
         private RenderMode _renderMode = RenderMode.None;
         private List<ImagePlacement> _currentPlacements = new List<ImagePlacement>();
         private int _currentCanvasWidth;
@@ -54,6 +96,7 @@ namespace GPUStitch
         {
             InitializeComponent();
 
+            // 滑块值展示单独放在这里绑定，避免在 XAML 中再引入额外转换器。
             SliderBlendWidth.ValueChanged += (s, e) =>
                 TxtBlendValue.Text = ((int)SliderBlendWidth.Value).ToString();
             SliderOverlap.ValueChanged += (s, e) =>
@@ -64,6 +107,8 @@ namespace GPUStitch
         {
             try
             {
+                // 先初始化所有 GPU 服务对象，再把 D3D11Image 的回调接进来。
+                // 这样一旦 WPF 触发首次渲染，底层资源已经全部就绪。
                 _deviceManager = new D3DDeviceManager();
                 _deviceManager.Initialize();
 
@@ -118,19 +163,23 @@ namespace GPUStitch
 
             try
             {
+                // 新一轮导入前先中止旧任务，避免两批图片交叉写入同一套状态。
                 CancelCurrentLoad();
 
                 SetLoadingUiState(isLoading: true);
                 UpdateStatus("正在分析图片元数据...");
 
+                // 元数据探测在后台执行：这里只需要宽高和路径，不需要立刻解码整图。
                 var combinedMetadata = await Task.Run(() => BuildCombinedMetadata(dlg.FileNames));
                 SortMetadataForStreaming(combinedMetadata);
 
+                // 先做预算，再决定真正的导入比例。
                 var loadPlan = ImageLoadPlanner.Build(
                     combinedMetadata,
                     SourceTextureBudgetBytes,
                     MaxPerImagePreviewDimension);
 
+                // 提前生成预览布局，用户会先看到一块待填充的画布。
                 PrepareProgressivePreview(combinedMetadata, loadPlan);
 
                 _loadCts = new CancellationTokenSource();
@@ -192,6 +241,7 @@ namespace GPUStitch
 
             try
             {
+                // 精配准期间锁住关键按钮，防止用户在布局更新中途再次触发导入或拼图。
                 BtnStitch.IsEnabled = false;
                 BtnRecommend.IsEnabled = false;
                 BtnLoadImages.IsEnabled = false;
@@ -203,6 +253,7 @@ namespace GPUStitch
                 var registrationOptions =
                     RegistrationOptions.CreateForImages(images, overlapPixels);
 
+                // 配准是纯计算任务，放到后台线程执行，避免阻塞 UI 线程。
                 var layout = await Task.Run(() =>
                     _registration!.ComputeLayout(images, registrationOptions));
 
@@ -212,6 +263,8 @@ namespace GPUStitch
                     return;
                 }
 
+                // 注意：这里得到的是“真实配准布局”；
+                // 但为了能稳定显示在 WPF 中，还需要经过一次预览预算缩放和整数像素对齐。
                 var preview = PreparePreviewLayout(layout, blendWidth);
                 ApplyFeatherHints(preview.Placements, preview.BlendWidth);
 
@@ -271,6 +324,10 @@ namespace GPUStitch
             ApplyRecommendedParameters(showStatus: true);
         }
 
+        /// <summary>
+        /// 直接显示第一张已加载图片。
+        /// 该模式主要用于快速核对原图内容、纹理清晰度和当前导入比例是否符合预期。
+        /// </summary>
         private void BtnShowSingle_Click(object sender, RoutedEventArgs e)
         {
             var image = GetFirstLoadedImage();
@@ -282,6 +339,7 @@ namespace GPUStitch
 
             try
             {
+                // 单图模式下不需要 placement，也不需要累积画布。
                 _currentCanvasWidth = image.Width;
                 _currentCanvasHeight = image.Height;
                 _currentPlacements = new List<ImagePlacement>();
@@ -307,6 +365,7 @@ namespace GPUStitch
 
         private void BtnClear_Click(object sender, RoutedEventArgs e)
         {
+            // 清空操作既要终止后台导入，也要释放已上传的 GPU 纹理。
             CancelCurrentLoad();
             ClearAllImages();
 
@@ -321,6 +380,7 @@ namespace GPUStitch
 
         private void Window_Closing(object? sender, System.ComponentModel.CancelEventArgs e)
         {
+            // 关闭窗口时按“高层状态 -> GPU 资源”顺序回收，避免回调仍访问已释放对象。
             CancelCurrentLoad();
             ClearAllImages();
 
@@ -331,6 +391,16 @@ namespace GPUStitch
             _deviceManager?.Dispose();
         }
 
+        /// <summary>
+        /// D3D11Image 每一帧都会回调这里。
+        ///
+        /// 这是整个预览链路的关键枢纽：
+        /// - 单图模式下直接 CopyResource；
+        /// - 拼图模式下走“增量累加 + 最终归一化”两阶段流程。
+        ///
+        /// 这个方法必须尽量短、尽量确定，因为它运行在 WPF 合成相关的渲染节奏中，
+        /// 一旦这里做了过多重复工作，就会直接表现为界面卡顿。
+        /// </summary>
         private void RenderFrame(IntPtr surface, bool isNewSurface)
         {
             if (surface == IntPtr.Zero || !_gpuInitialized)
@@ -341,6 +411,8 @@ namespace GPUStitch
 
             try
             {
+                // D3D11Image 的底层共享表面可能在尺寸变化或表面重建时失效，
+                // 因此每次都要校验它是否仍与当前画布尺寸匹配。
                 if (isNewSurface ||
                     _sharedRenderTarget == null ||
                     _sharedRenderTarget.Description.Width != _currentCanvasWidth ||
@@ -359,13 +431,15 @@ namespace GPUStitch
                         var image = GetFirstLoadedImage();
                         if (image != null)
                         {
+                            // 单图显示是最便宜的路径：直接把源纹理复制到共享表面即可。
                             _deviceManager!.Context.CopyResource(_sharedRenderTarget, image.Texture);
                         }
                         break;
                     }
                     case RenderMode.Stitch:
                     {
-                        // 增量累加：仅处理尚未累加的新图像
+                        // 第一次进入拼图模式时才真正创建并清空累积画布。
+                        // 后续帧重用它，从而避免“每帧重新从第一张图拼到最后一张图”。
                         if (!_canvasPrepared)
                         {
                             _stitcher!.PrepareCanvas(_currentCanvasWidth, _currentCanvasHeight);
@@ -373,6 +447,8 @@ namespace GPUStitch
                             _canvasPrepared = true;
                         }
 
+                        // 只把“本轮新到达”的图像累加进去。
+                        // 这正是渐进式导入预览不卡的核心原因。
                         int count = Math.Min(_imageSlots.Count, _currentPlacements.Count);
                         for (int i = 0; i < count; i++)
                         {
@@ -385,6 +461,8 @@ namespace GPUStitch
 
                         if (_accumulatedIndices.Count > 0)
                         {
+                            // Finalize 的代价远低于重新 Accumulate 全部图像，
+                            // 所以每次有新增内容时都做一次归一化输出是可接受的。
                             _stitcher!.FinalizeAndCopy(
                                 _currentCanvasWidth, _currentCanvasHeight, _sharedRenderTarget);
                         }
@@ -404,6 +482,13 @@ namespace GPUStitch
             }
         }
 
+        /// <summary>
+        /// 按“有限并发 + 按完成顺序提交”的方式逐张加载图片。
+        ///
+        /// 这里刻意没有使用“全部任务一次性启动”的写法：
+        /// 因为对于大量显微图片来说，解码、上传和纹理常驻都会带来较高瞬时压力，
+        /// 用小并发窗口可以显著降低卡顿和资源峰值。
+        /// </summary>
         private async Task LoadImagesProgressivelyAsync(
             IReadOnlyList<ImageFileMetadata> metadata,
             ImageLoadPlan loadPlan,
@@ -414,6 +499,7 @@ namespace GPUStitch
 
             while (nextIndex < metadata.Count || pending.Count > 0)
             {
+                // 维持一个固定大小的“在途任务池”。
                 while (pending.Count < MaxParallelLoads && nextIndex < metadata.Count)
                 {
                     int index = nextIndex++;
@@ -426,6 +512,7 @@ namespace GPUStitch
                 LoadedImageResult result = await finished;
                 if (cancellationToken.IsCancellationRequested)
                 {
+                    // 如果取消发生在图片已经上传之后，需要显式释放这张中间产物。
                     result.Image.Dispose();
                     break;
                 }
@@ -435,6 +522,8 @@ namespace GPUStitch
 
                 if (loadedCount == 1)
                 {
+                    // 第一张图到达时就允许进入 Stitch 预览模式，
+                    // 后面每来一张都会继续往同一个累积画布里贴。
                     _renderMode = RenderMode.Stitch;
                     _sharedRenderTarget = null;
                 }
@@ -446,10 +535,15 @@ namespace GPUStitch
                     $"正在导入并贴图: {loadedCount}/{metadata.Count}，" +
                     $"缩放 {loadPlan.Scale:F3}x");
 
+                // 主动把机会让回 Dispatcher，使状态文本和画面刷新能及时显示出来。
                 await Dispatcher.Yield(DispatcherPriority.Background);
             }
         }
 
+        /// <summary>
+        /// 在后台线程中解码图片并上传到 GPU。
+        /// 返回结果同时带回原始槽位索引，这样完成顺序与输入顺序可以解耦。
+        /// </summary>
         private Task<LoadedImageResult> LoadSingleImageAsync(
             ImageFileMetadata metadata,
             int index,
@@ -470,6 +564,7 @@ namespace GPUStitch
 
         private List<ImageFileMetadata> BuildCombinedMetadata(IReadOnlyList<string> newFilePaths)
         {
+            // 允许“继续追加导入”，但要对路径去重，避免同一张图被重复加入会话。
             var combinedMetadata = new List<ImageFileMetadata>();
             var seenPaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
@@ -494,6 +589,10 @@ namespace GPUStitch
             return combinedMetadata;
         }
 
+        /// <summary>
+        /// 若所有文件名都能解析成行列号，则按“行优先、列次之”排序。
+        /// 这样渐进式导入时，用户看到的贴图顺序会更接近显微镜实际采集顺序。
+        /// </summary>
         private void SortMetadataForStreaming(List<ImageFileMetadata> metadata)
         {
             bool allGridNamed = true;
@@ -521,6 +620,15 @@ namespace GPUStitch
             });
         }
 
+        /// <summary>
+        /// 为新一轮导入建立“空画布 + 空槽位 + 初始布局”。
+        ///
+        /// 这个阶段并不会真正解码图片，只会准备：
+        /// - 会话级图片槽位；
+        /// - 网格索引；
+        /// - 预览布局；
+        /// - 当前拼图器参数。
+        /// </summary>
         private void PrepareProgressivePreview(
             IReadOnlyList<ImageFileMetadata> metadata,
             ImageLoadPlan loadPlan)
@@ -548,6 +656,8 @@ namespace GPUStitch
             int overlapPixels = Math.Max(16, (int)SliderOverlap.Value);
             float blendWidth = (float)SliderBlendWidth.Value;
 
+            // 先用命名规则/默认重叠构建“粗布局”，
+            // 后续用户点击配准时，再替换为真正由内容相关性求出的精布局。
             var provisionalLayout = BuildProvisionalLayout(_loadedMetadata, loadPlan.Scale, overlapPixels);
             var preview = PreparePreviewLayout(provisionalLayout, blendWidth);
             ApplyFeatherHints(preview.Placements, preview.BlendWidth);
@@ -565,6 +675,10 @@ namespace GPUStitch
             InteropImage.RequestRender();
         }
 
+        /// <summary>
+        /// 根据当前元数据生成一个“足够可视化”的初始布局。
+        /// 若能识别规则网格则按二维排布，否则退化为单行拼接。
+        /// </summary>
         private RegistrationLayout BuildProvisionalLayout(
             IReadOnlyList<ImageFileMetadata> metadata,
             float imageScale,
@@ -576,6 +690,17 @@ namespace GPUStitch
             return BuildSequentialProvisionalLayout(metadata, imageScale, overlapPixels);
         }
 
+        /// <summary>
+        /// 通过文件名中的网格坐标快速构建一个二维预布局。
+        ///
+        /// 这一步不做图像内容配准，只使用：
+        /// - 每一行的最大高度；
+        /// - 每一列的最大宽度；
+        /// - 用户给定的预估重叠像素。
+        ///
+        /// 它的意义是让渐进式预览从第一张图开始就有“落点”，
+        /// 而不必等待全部图片都加载并完成精配准。
+        /// </summary>
         private bool TryBuildGridProvisionalLayout(
             IReadOnlyList<ImageFileMetadata> metadata,
             float imageScale,
@@ -611,11 +736,14 @@ namespace GPUStitch
                     : width;
             }
 
+            // 重叠像素同样要按预览比例缩放，才能保持预布局的几何关系一致。
             float scaledOverlap = Math.Max(1.0f, overlapPixels * imageScale);
 
             var rowOffsets = new Dictionary<int, float>();
             var columnOffsets = new Dictionary<int, float>();
 
+            // 行偏移和列偏移分别独立累加：
+            // 每推进一格，都以前一行/列的尺寸减去重叠量作为步长。
             float currentY = 0;
             int? previousRow = null;
             foreach (int row in rows)
@@ -674,6 +802,10 @@ namespace GPUStitch
             return true;
         }
 
+        /// <summary>
+        /// 退化布局：当文件名无法解析出二维网格时，按单行顺序排列。
+        /// 这保证了即便没有显式行列信息，系统仍能给出一个可视化预览。
+        /// </summary>
         private static RegistrationLayout BuildSequentialProvisionalLayout(
             IReadOnlyList<ImageFileMetadata> metadata,
             float imageScale,
@@ -712,6 +844,10 @@ namespace GPUStitch
                 new List<PairRegistrationResult>());
         }
 
+        /// <summary>
+        /// 根据当前已加载情况修正每张图实际参与羽化的边。
+        /// 这个辅助结果主要用于“邻居尚未加载完全”的渐进式阶段。
+        /// </summary>
         private RenderSnapshot BuildRenderSnapshot()
         {
             var images = new List<GpuImage>();
@@ -751,6 +887,9 @@ namespace GPUStitch
             return new RenderSnapshot(images, placements);
         }
 
+        /// <summary>
+        /// 判断指定网格坐标处的图片是否已经真正加载完成。
+        /// </summary>
         private bool IsImageLoadedAt(int row, int column)
         {
             if (!_indexByCoordinate.TryGetValue(new GridImageCoordinate(row, column), out int index))
@@ -759,6 +898,12 @@ namespace GPUStitch
             return index >= 0 && index < _imageSlots.Count && _imageSlots[index] != null;
         }
 
+        /// <summary>
+        /// 给每张图写入羽化提示。
+        ///
+        /// 这里区分“有无邻居”而不是“是否一定存在重叠像素”，
+        /// 因为当前阶段的目标是先生成一个稳定、直观的默认混合策略。
+        /// </summary>
         private void ApplyFeatherHints(List<ImagePlacement> placements, float blendWidth)
         {
             if (placements.Count == 0 || blendWidth <= 0.0f)
@@ -790,6 +935,10 @@ namespace GPUStitch
             }
         }
 
+        /// <summary>
+        /// 基于当前已加载图片自动推荐重叠宽度和混合宽度。
+        /// 这一步不会改动布局本身，只更新 UI 滑块的建议值。
+        /// </summary>
         private void ApplyRecommendedParameters(bool showStatus)
         {
             var loadedImages = GetLoadedImagesInOrder();
@@ -822,6 +971,10 @@ namespace GPUStitch
             }
         }
 
+        /// <summary>
+        /// 以原始导入顺序返回当前已加载完成的图片集合。
+        /// 这个顺序对顺序拼接、参数推荐和状态显示都很重要。
+        /// </summary>
         private List<GpuImage> GetLoadedImagesInOrder()
         {
             var images = new List<GpuImage>();
@@ -835,6 +988,10 @@ namespace GPUStitch
             return images;
         }
 
+        /// <summary>
+        /// 获取第一张已加载图片。
+        /// 用于单图预览以及部分“至少有一张图即可”的 UI 逻辑。
+        /// </summary>
         private GpuImage? GetFirstLoadedImage()
         {
             for (int i = 0; i < _imageSlots.Count; i++)
@@ -846,6 +1003,9 @@ namespace GPUStitch
             return null;
         }
 
+        /// <summary>
+        /// 统计当前已成功加载到 GPU 的图片数量。
+        /// </summary>
         private int GetLoadedCount()
         {
             int count = 0;
@@ -858,6 +1018,10 @@ namespace GPUStitch
             return count;
         }
 
+        /// <summary>
+        /// 清空当前会话的所有图片与布局状态。
+        /// 这里会释放所有已上传的 GPU 纹理，是真正意义上的“重置会话”。
+        /// </summary>
         private void ClearAllImages()
         {
             for (int i = 0; i < _imageSlots.Count; i++)
@@ -877,6 +1041,10 @@ namespace GPUStitch
             _accumulatedIndices.Clear();
         }
 
+        /// <summary>
+        /// 取消正在进行的导入任务。
+        /// 该方法既负责发出取消信号，也负责回收 CancellationTokenSource 本身。
+        /// </summary>
         private void CancelCurrentLoad()
         {
             if (_loadCts == null)
@@ -894,6 +1062,9 @@ namespace GPUStitch
             }
         }
 
+        /// <summary>
+        /// 根据“是否正在导入”统一切换工具栏按钮状态。
+        /// </summary>
         private void SetLoadingUiState(bool isLoading)
         {
             _isLoading = isLoading;
@@ -903,16 +1074,25 @@ namespace GPUStitch
             BtnShowSingle.IsEnabled = GetLoadedImagesInOrder().Count >= 1;
         }
 
+        /// <summary>
+        /// 更新状态栏文本。
+        /// </summary>
         private void UpdateStatus(string message)
         {
             TxtStatus.Text = message;
         }
 
+        /// <summary>
+        /// 以 MiB 形式格式化字节数，便于在状态栏中展示预算信息。
+        /// </summary>
         private static string FormatMiB(long bytes)
         {
             return $"{(bytes / 1024.0 / 1024.0):F1} MiB";
         }
 
+        /// <summary>
+        /// 把推荐值约束到滑块可选范围内。
+        /// </summary>
         private static double ClampForSlider(double value, double min, double max)
         {
             if (value < min)
@@ -922,6 +1102,14 @@ namespace GPUStitch
             return value;
         }
 
+        /// <summary>
+        /// 把“原始布局”压缩成“适合 WPF 预览”的布局。
+        ///
+        /// 这里同时处理三件事：
+        /// 1. 受纹理尺寸限制的缩放；
+        /// 2. 受总预算限制的缩放；
+        /// 3. 为避免缩小时条纹而做的整数像素对齐。
+        /// </summary>
         private static PreviewLayout PreparePreviewLayout(
             RegistrationLayout layout,
             float blendWidth)
@@ -932,6 +1120,8 @@ namespace GPUStitch
                     MaxPreviewTextureSize / (float)layout.CanvasWidth,
                     MaxPreviewTextureSize / (float)layout.CanvasHeight));
 
+            // 20 字节/像素是一个经验性的保守估算：
+            // 既覆盖 R32G32B32A32_Float 累积纹理，也留出输出纹理和驱动层额外开销。
             double rawCanvasBytes = (double)layout.CanvasWidth * layout.CanvasHeight * 20.0;
             float byteBudgetScale = 1.0f;
             if (rawCanvasBytes > MaxPreviewCanvasBytes && rawCanvasBytes > 1.0)
@@ -971,7 +1161,9 @@ namespace GPUStitch
                 scaledBlend = Math.Max(1.0f, blendWidth * scale);
             }
 
-            // 将偏移和尺寸四舍五入到整数像素，消除亚像素间隙导致的条纹
+            // 将偏移和尺寸四舍五入到整数像素，消除亚像素间隙导致的条纹。
+            // 这是当前版本里非常关键的稳定性处理：如果 placement 落在半像素位置，
+            // WPF 再次缩放显示时就更容易看到暗纹和摩尔纹。
             int canvasWidth = 0, canvasHeight = 0;
             for (int i = 0; i < placements.Count; i++)
             {
@@ -997,6 +1189,10 @@ namespace GPUStitch
                 scale);
         }
 
+        /// <summary>
+        /// 预览布局打包对象。
+        /// 用于一次性返回缩放后的画布尺寸、placements、混合宽度和最终缩放因子。
+        /// </summary>
         private sealed class PreviewLayout
         {
             public PreviewLayout(
@@ -1020,6 +1216,9 @@ namespace GPUStitch
             public float Scale { get; }
         }
 
+        /// <summary>
+        /// 单张图片异步加载完成后的回传结果。
+        /// </summary>
         private sealed class LoadedImageResult
         {
             public LoadedImageResult(int index, GpuImage image)
@@ -1032,6 +1231,10 @@ namespace GPUStitch
             public GpuImage Image { get; }
         }
 
+        /// <summary>
+        /// 渲染快照。
+        /// 当前主要作为“带羽化修正后的已加载图片集合”容器保留，便于后续扩展。
+        /// </summary>
         private sealed class RenderSnapshot
         {
             public RenderSnapshot(List<GpuImage> images, List<ImagePlacement> placements)
@@ -1044,6 +1247,9 @@ namespace GPUStitch
             public List<ImagePlacement> Placements { get; }
         }
 
+        /// <summary>
+        /// 当前显示模式。
+        /// </summary>
         private enum RenderMode
         {
             None,

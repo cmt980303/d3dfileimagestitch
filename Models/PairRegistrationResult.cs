@@ -1,4 +1,4 @@
-namespace GPUStitch.Core
+namespace GPUStitch.Models
 {
     /// <summary>
     /// 描述配准发生在水平方向还是垂直方向。

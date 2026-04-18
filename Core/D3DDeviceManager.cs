@@ -9,16 +9,21 @@ using static Vortice.Direct3D11.D3D11;
 namespace GPUStitch.Core
 {
     /// <summary>
-    /// D3D 设备管理器
-    /// 
-    /// 核心设计（参考官方 WPFDXInterop C++ 示例）：
-    /// 1. 创建自己的 D3D11 设备（与 D3D11Image 内部设备是不同实例）
-    /// 2. D3D11Image OnRender 传入的 surface 是"共享纹理"（MiscFlags=Shared）
-    /// 3. 通过 IDXGIResource.SharedHandle 获取共享句柄
-    /// 4. 用 OpenSharedResource 在自己的设备上打开同一块 GPU 显存
-    /// 5. 在自己的设备上渲染（CopyResource / Dispatch），然后 Flush
-    /// 
-    /// 这样所有 GPU 资源都在同一设备上，不会有跨设备错误。
+    /// D3D11 设备管理器。
+    ///
+    /// 本项目中最容易误解的点之一是：WPF 的 <c>D3D11Image</c> 并不会直接把它内部使用的
+    /// D3D 设备暴露给应用层，因此我们需要自己创建一套 D3D11 设备，并通过“共享纹理句柄”
+    /// 与 WPF 的显示链路对接。
+    ///
+    /// 整体协作方式如下：
+    /// 1. 本类创建自己的 D3D11 设备和即时上下文；
+    /// 2. WPF 在回调中给出一个共享 surface 指针；
+    /// 3. 本类把该 surface 转成 IDXGIResource 并取出 SharedHandle；
+    /// 4. 再用自己的设备打开同一块显存；
+    /// 5. 拼图和配准模块都在“自己的设备”上工作；
+    /// 6. 最终结果通过共享资源显示到 WPF 界面。
+    ///
+    /// 这样可以避免跨设备拷贝和资源不兼容问题，也把底层互操作复杂度收敛到一个类中。
     /// </summary>
     public class D3DDeviceManager : IDisposable
     {
@@ -40,6 +45,7 @@ namespace GPUStitch.Core
         /// </summary>
         public void Initialize()
         {
+            // 按从高到低的特性级别尝试，优先使用完整 D3D11 功能。
             var featureLevels = new[]
             {
                 FeatureLevel.Level_11_0,
@@ -47,7 +53,7 @@ namespace GPUStitch.Core
                 FeatureLevel.Level_10_0,
             };
 
-            // 创建硬件加速的 D3D11 设备
+            // 创建硬件加速设备，并启用 BGRA 支持以兼容 WPF 的像素格式要求。
             var result = D3D11CreateDevice(
                 IntPtr.Zero,                         // 使用默认适配器
                 DriverType.Hardware,
@@ -79,19 +85,18 @@ namespace GPUStitch.Core
             if (surfacePointer == IntPtr.Zero)
                 throw new ArgumentException("surface 指针不能为空", nameof(surfacePointer));
 
-            // 释放之前的共享纹理
+            // 同一个窗口在尺寸变化或表面重建后可能产生新的共享表面，
+            // 因此这里每次重新打开前都先释放旧引用。
             _sharedRenderTarget?.Dispose();
             _sharedRenderTarget = null;
 
             var surface = new ComObject(surfacePointer).QueryInterface<IDXGIResource>();
             var sharedHandle = surface.SharedHandle;
-            // 获取共享句柄（纯 Marshal 调用，不涉及 ComObject 包装器）
-            //IntPtr sharedHandle = GetDXGISharedHandle(surfacePointer);
 
             if (sharedHandle == IntPtr.Zero)
                 throw new InvalidOperationException("无法获取 D3D11Image surface 的共享句柄");
 
-            // 在我们的设备上打开共享资源
+            // 在我们自己的设备上重新打开这块显存，后续所有渲染命令都针对这个对象执行。
             _sharedRenderTarget = Device.OpenSharedResource<ID3D11Texture2D>(sharedHandle);
 
             return _sharedRenderTarget;

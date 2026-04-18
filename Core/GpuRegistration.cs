@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.IO;
 using System.Reflection;
 using System.Runtime.InteropServices;
+using GPUStitch.Models;
 using Vortice.D3DCompiler;
 using Vortice.Direct3D11;
 using Vortice.DXGI;
@@ -78,6 +79,12 @@ namespace GPUStitch.Core
         /// 对一对相邻图片做 GPU 配准。
         /// axis=Horizontal 时表示“左 -> 右”；
         /// axis=Vertical 时表示“上 -> 下”。
+        ///
+        /// 调用链分为四步：
+        /// 1. 根据预估重叠和搜索窗口准备 score 纹理；
+        /// 2. 把尺寸、阈值、权重写入常量缓冲区；
+        /// 3. 在 GPU 上为每个候选位移计算一个相关性分数；
+        /// 4. 回读 score 图，选取得分最高的候选偏移。
         /// </summary>
         public PairRegistrationResult RegisterPair(
             GpuImage first,
@@ -94,6 +101,7 @@ namespace GPUStitch.Core
             if (options == null)
                 throw new ArgumentNullException(nameof(options));
 
+            // overlapSize 不是任意值，而是被限制在两张图尺寸可容纳的范围内。
             int overlapSize = axis == RegistrationAxis.Horizontal
                 ? Clamp(options.ExpectedHorizontalOverlap, 8, Math.Min(first.Width, second.Width) - 2)
                 : Clamp(options.ExpectedVerticalOverlap, 8, Math.Min(first.Height, second.Height) - 2);
@@ -125,6 +133,8 @@ namespace GPUStitch.Core
             ctx.CopyResource(_scoreReadbackTexture!, _scoreTexture!);
             ctx.Flush();
 
+            // GPU 输出的是“搜索空间中的最佳局部修正量”，
+            // 还需要再换算成从第一张图到第二张图的实际相对位移。
             var best = ReadBestScore(candidateCountX, candidateCountY);
 
             int relativeOffsetX;
@@ -146,6 +156,8 @@ namespace GPUStitch.Core
             bool isConfident = best.Score >= options.ConfidenceThreshold;
             if (!isConfident)
             {
+                // 当相关性不可信时，系统退回到“仅根据预估重叠得到的保守位移”。
+                // 这样至少能维持整体布局连续，而不是让单条错误边把全局结果拉崩。
                 if (axis == RegistrationAxis.Horizontal)
                 {
                     relativeOffsetX = Math.Max(1, first.Width - overlapSize);
@@ -202,6 +214,7 @@ namespace GPUStitch.Core
             var positionsY = new float[images.Count];
             var pairResults = new List<PairRegistrationResult>(images.Count - 1);
 
+            // 顺序布局就是把每一对相邻图的相对位移累积起来。
             for (int i = 1; i < images.Count; i++)
             {
                 var result = RegisterPair(
@@ -236,6 +249,7 @@ namespace GPUStitch.Core
         {
             layout = RegistrationLayout.Empty;
 
+            // 第一步：把每张图映射到唯一的网格坐标。
             var coordinates = new GridImageCoordinate[images.Count];
             var indexByCoordinate = new Dictionary<GridImageCoordinate, int>();
             var sortedIndices = new List<int>(images.Count);
@@ -261,6 +275,7 @@ namespace GPUStitch.Core
                     : coordinates[left].Column.CompareTo(coordinates[right].Column);
             });
 
+            // 第二步：构建邻接图，边上保存“从一张图走到另一张图的相对位移”。
             var adjacency = new List<RegistrationEdge>[images.Count];
             for (int i = 0; i < adjacency.Length; i++)
             {
@@ -269,6 +284,7 @@ namespace GPUStitch.Core
 
             var pairResults = new List<PairRegistrationResult>();
 
+            // 第三步：只计算右邻居和下邻居，避免重复配准。
             for (int i = 0; i < sortedIndices.Count; i++)
             {
                 int currentIndex = sortedIndices[i];
@@ -311,6 +327,8 @@ namespace GPUStitch.Core
             float nominalStepX = EstimateNominalHorizontalStep(images, options);
             float nominalStepY = EstimateNominalVerticalStep(images, options);
 
+            // 第四步：把局部边位移传播为全局坐标。
+            // 如果图不完全连通，则使用名义步长给新的连通分量一个保守起点。
             var positionsX = new float[images.Count];
             var positionsY = new float[images.Count];
             var visited = new bool[images.Count];
@@ -403,6 +421,8 @@ namespace GPUStitch.Core
             float[] positionsY,
             List<PairRegistrationResult> pairResults)
         {
+            // 先找整体包围盒，再把最小坐标平移到 (0, 0)，
+            // 这样最终 placement 就能直接作为画布内坐标使用。
             float minX = 0;
             float minY = 0;
             float maxX = images[0].Width;
@@ -481,6 +501,8 @@ namespace GPUStitch.Core
             if (_scoreTexture != null && _scoreWidth == width && _scoreHeight == height)
                 return;
 
+            // 分数贴图的尺寸由搜索窗口决定，而不是由输入图尺寸决定。
+            // 每个像素都表示一个候选位移的得分。
             _scoreUav?.Dispose();
             _scoreTexture?.Dispose();
             _scoreReadbackTexture?.Dispose();
@@ -520,6 +542,7 @@ namespace GPUStitch.Core
             RegistrationOptions options,
             RegistrationAxis axis)
         {
+            // 常量缓冲区把 CPU 侧“候选搜索问题”的全部描述一次性送到 GPU。
             var constants = new RegistrationConstants
             {
                 FirstWidth = first.Width,
@@ -549,6 +572,8 @@ namespace GPUStitch.Core
             int bestY = 0;
             float bestScore = float.NegativeInfinity;
 
+            // ScoreTexture 是二维搜索图：
+            // x 轴对应 deltaX 候选，y 轴对应 deltaY 候选。
             var mapped = _deviceManager.Context.Map(_scoreReadbackTexture!, 0, MapMode.Read);
             try
             {

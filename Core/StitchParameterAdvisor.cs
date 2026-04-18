@@ -3,19 +3,28 @@ using System.Collections.Generic;
 using System.IO;
 using System.Windows.Media;
 using System.Windows.Media.Imaging;
+using GPUStitch.Models;
 
 namespace GPUStitch.Core
 {
-    public sealed class StitchParameterRecommendation
-    {
-        public int OverlapPixels { get; set; }
-        public int BlendWidth { get; set; }
-        public float Confidence { get; set; }
-        public int EvaluatedPairCount { get; set; }
-    }
-
+    /// <summary>
+    /// 拼图参数推荐器。
+    ///
+    /// 它试图根据一批已加载图片，给出两个对用户最有帮助的初始参数：
+    /// 1. 相邻图片的重叠像素；
+    /// 2. 重叠区域的混合羽化宽度。
+    ///
+    /// 当前算法并不依赖完整 GPU 配准，而是走一条更轻量的启发式路径：
+    /// - 从磁盘重新读取小尺寸灰度预览；
+    /// - 对相邻图做梯度相关性搜索；
+    /// - 统计一批图像对的重叠估计中位数；
+    /// - 再把它映射成用户可直接使用的 overlap / blend 值。
+    /// </summary>
     public static class StitchParameterAdvisor
     {
+        /// <summary>
+        /// 对当前图片集合给出一组推荐参数。
+        /// </summary>
         public static StitchParameterRecommendation Recommend(IReadOnlyList<GpuImage> images)
         {
             if (images == null || images.Count == 0)
@@ -44,6 +53,8 @@ namespace GPUStitch.Core
                 };
             }
 
+            // 这里使用多个图像对的统计结果，而不是只看一对，
+            // 这样对局部异常、内容单一或个别坏片更稳。
             var overlaps = new List<int>();
             float scoreSum = 0;
             int scoreCount = 0;
@@ -104,6 +115,13 @@ namespace GPUStitch.Core
             };
         }
 
+        /// <summary>
+        /// 对一对小预览图估计重叠宽度。
+        /// 这里把搜索问题简化为：
+        /// - 枚举若干 overlap 候选；
+        /// - 对每个 overlap 再枚举少量 Y 方向漂移；
+        /// - 选取梯度相关性最高的一组参数。
+        /// </summary>
         private static PairEstimate EstimatePairOverlap(PreviewImage left, PreviewImage right, int sourceMinWidth)
         {
             int previewMinWidth = Math.Min(left.Width, right.Width);
@@ -136,6 +154,12 @@ namespace GPUStitch.Core
             };
         }
 
+        /// <summary>
+        /// 计算两幅灰度预览在某个 overlap/shiftY 假设下的梯度相关性。
+        ///
+        /// 这里故意使用梯度而不是直接用亮度，是因为显微图像常出现照明不均、
+        /// 暗角、整体亮度漂移等问题，梯度对这些低频亮度变化更不敏感。
+        /// </summary>
         private static float ComputeGradientCorrelation(
             PreviewImage left,
             PreviewImage right,
@@ -151,6 +175,7 @@ namespace GPUStitch.Core
             float sumRight = 0;
             int sampleCount = 0;
 
+            // 以 2 像素步长采样，牺牲一点精度换更高吞吐。
             for (int y = yStart; y < yEnd; y += 2)
             {
                 for (int x = 1; x < overlapWidth - 1; x += 2)
@@ -183,6 +208,10 @@ namespace GPUStitch.Core
             return (float)(sumDot / Math.Sqrt(sumLeft * sumRight));
         }
 
+        /// <summary>
+        /// 从磁盘读取一张用于参数推荐的小灰度预览。
+        /// 这个路径独立于 GPU 纹理，不会干扰当前显示链路。
+        /// </summary>
         private static PreviewImage LoadPreview(string filePath, int maxDimension)
         {
             var bitmap = new BitmapImage();
@@ -228,12 +257,18 @@ namespace GPUStitch.Core
             return value;
         }
 
+        /// <summary>
+        /// 单对图片的重叠估计结果。
+        /// </summary>
         private sealed class PairEstimate
         {
             public int OverlapPixels { get; set; }
             public float Score { get; set; }
         }
 
+        /// <summary>
+        /// 只用于推荐算法的轻量灰度图封装。
+        /// </summary>
         private sealed class PreviewImage
         {
             private readonly byte[] _pixels;

@@ -2,7 +2,7 @@ using System;
 using System.IO;
 using System.Text.RegularExpressions;
 
-namespace GPUStitch.Core
+namespace GPUStitch.Models
 {
     /// <summary>
     /// 文件名中解析出的图像网格坐标。

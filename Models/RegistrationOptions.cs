@@ -1,7 +1,7 @@
 using System;
 using System.Collections.Generic;
 
-namespace GPUStitch.Core
+namespace GPUStitch.Models
 {
     /// <summary>
     /// 配准参数集合。

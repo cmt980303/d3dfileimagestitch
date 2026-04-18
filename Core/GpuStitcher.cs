@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.IO;
 using System.Reflection;
 using System.Runtime.InteropServices;
+using GPUStitch.Models;
 using Vortice.D3DCompiler;
 using Vortice.Direct3D11;
 using Vortice.DXGI;
@@ -10,27 +11,9 @@ using Vortice.DXGI;
 namespace GPUStitch.Core
 {
     /// <summary>
-    /// 描述一张图在输出画布上的显示位置与显示尺寸。
-    /// 这里的 Width/Height 表示“绘制到输出纹理时的尺寸”，
-    /// 因此它既可以等于原图大小，也可以是为了大图预览而缩小后的尺寸。
-    /// </summary>
-    public struct ImagePlacement
-    {
-        public float OffsetX;
-        public float OffsetY;
-        public float Width;
-        public float Height;
-        public float FeatherLeft;
-        public float FeatherRight;
-        public float FeatherTop;
-        public float FeatherBottom;
-    }
-
-    /// <summary>
     /// GPU 拼图器。
     ///
-    /// 与旧版“一次绑定 16 张图再统一计算”的方式不同，
-    /// 当前实现采用“两阶段”策略：
+    /// 与旧版“一次绑定多张图统一计算”的方式不同，当前实现采用“两阶段”策略：
     /// 1. 每次只绑定 1 张源图，将其累加到浮点累积纹理；
     /// 2. 所有图处理完成后，再做一次归一化输出。
     ///
@@ -38,6 +21,12 @@ namespace GPUStitch.Core
     /// - 不再受 D3D11 shader resource slot 数量限制；
     /// - 理论上可以处理任意多张图，瓶颈转为时间与显存；
     /// - 更适合后续做分块、流式、大图预览。
+    ///
+    /// 这里的“累积纹理”本质上保存的是：
+    /// - RGB：加权后的颜色和；
+    /// - A：对应位置累计权重和。
+    ///
+    /// 最终只需要再做一次 rgb / a，就能得到经过羽化融合的结果。
     /// </summary>
     public sealed class GpuStitcher : IDisposable
     {
@@ -80,6 +69,7 @@ namespace GPUStitch.Core
         /// </summary>
         public void Initialize()
         {
+            // 三个着色器分别负责：单张图累加、清空累积纹理、最终归一化输出。
             _accumulateShader = CompileShader("GPUStitch.Shaders.StitchCS.hlsl");
             _clearShader = CompileShader("GPUStitch.Shaders.StitchClearCS.hlsl");
             _finalizeShader = CompileShader("GPUStitch.Shaders.StitchFinalizeCS.hlsl");
@@ -108,6 +98,7 @@ namespace GPUStitch.Core
             if (images.Count == 0 || images.Count != placements.Count)
                 throw new ArgumentException("图片数量和位置数量必须一致且不为空");
 
+            // 经典一次性拼图路径：清空 -> 累加所有图 -> 归一化 -> 输出。
             EnsureOutputResources(canvasWidth, canvasHeight);
             ClearAccumulationTexture();
 
@@ -126,6 +117,7 @@ namespace GPUStitch.Core
         /// </summary>
         public void PrepareCanvas(int canvasWidth, int canvasHeight)
         {
+            // 渐进式路径与一次性路径共享同一套资源，只是不在这里立刻累加全部图像。
             EnsureOutputResources(canvasWidth, canvasHeight);
             ClearAccumulationTexture();
         }
@@ -179,6 +171,7 @@ namespace GPUStitch.Core
 
         private ID3D11SamplerState CreateSamplerState()
         {
+            // 线性采样 + Clamp 足以满足当前缩放预览场景，避免边缘采样到图外内容。
             var desc = new SamplerDescription(
                 Filter.MinMagMipLinear,
                 TextureAddressMode.Clamp);
@@ -188,6 +181,7 @@ namespace GPUStitch.Core
 
         private ID3D11Buffer CreateConstantBuffer<T>() where T : struct
         {
+            // 这些常量缓冲区会被频繁改写，因此使用 Dynamic + CPU Write。
             var desc = new BufferDescription
             {
                 ByteWidth = Marshal.SizeOf<T>(),
@@ -207,6 +201,7 @@ namespace GPUStitch.Core
                 return;
             }
 
+            // 尺寸变化时必须整套重建，因为 UAV/SRV 都绑定在具体纹理对象上。
             _accumSrv?.Dispose();
             _accumUav?.Dispose();
             _accumTexture?.Dispose();
@@ -216,6 +211,8 @@ namespace GPUStitch.Core
             _outputWidth = width;
             _outputHeight = height;
 
+            // 累积纹理使用 128-bit float，是因为它既要存颜色和，也要存权重和，
+            // 使用高精度格式可以降低多张图叠加后的量化误差。
             var accumDesc = new Texture2DDescription
             {
                 Width = width,
@@ -234,6 +231,7 @@ namespace GPUStitch.Core
             _accumSrv = _deviceManager.Device.CreateShaderResourceView(_accumTexture);
             _accumUav = _deviceManager.Device.CreateUnorderedAccessView(_accumTexture);
 
+            // 最终输出纹理只用于显示，所以回到 BGRA8 即可，节省显存和带宽。
             var outputDesc = new Texture2DDescription
             {
                 Width = width,
@@ -274,6 +272,7 @@ namespace GPUStitch.Core
         /// </summary>
         private void AccumulateSingleImage(GpuImage image, ImagePlacement placement)
         {
+            // Dispatch 网格大小由这张图在目标画布中的显示尺寸决定。
             int imageWidth = Math.Max(1, (int)Math.Ceiling(placement.Width));
             int imageHeight = Math.Max(1, (int)Math.Ceiling(placement.Height));
 
@@ -291,6 +290,7 @@ namespace GPUStitch.Core
                 (imageHeight + ThreadGroupSize - 1) / ThreadGroupSize,
                 1);
 
+            // 解绑 SRV/UAV，避免后续其他 Pass 误复用同一绑定状态。
             ctx.CSSetShaderResources(0, new ID3D11ShaderResourceView[1]);
             ctx.CSSetUnorderedAccessView(0, (ID3D11UnorderedAccessView?)null);
         }
@@ -319,6 +319,8 @@ namespace GPUStitch.Core
 
         private void UpdateImageConstants(ImagePlacement placement)
         {
+            // 这里把托管侧布局模型转换成 HLSL 常量缓冲区。
+            // 要特别注意字段顺序必须和着色器中的 cbuffer 严格一致。
             var constants = new StitchImageConstants
             {
                 ImageParam = new Float4(placement.OffsetX, placement.OffsetY, placement.Width, placement.Height),
@@ -357,6 +359,7 @@ namespace GPUStitch.Core
 
             _disposed = true;
 
+            // 释放顺序按照“视图 -> 纹理 -> 缓冲区 -> 着色器”展开，便于阅读与排查。
             _accumSrv?.Dispose();
             _accumUav?.Dispose();
             _accumTexture?.Dispose();

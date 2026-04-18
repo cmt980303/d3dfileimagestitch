@@ -1,5 +1,6 @@
 using System;
 using System.IO;
+using GPUStitch.Models;
 using System.Windows.Media.Imaging;
 using Vortice.Direct3D11;
 using Vortice.DXGI;
@@ -7,13 +8,16 @@ using Vortice.DXGI;
 namespace GPUStitch.Core
 {
     /// <summary>
-    /// GPU 图片加载器
-    /// 将本地图片加载为 D3D11 Texture2D + SRV，供 Compute Shader 使用。
-    /// 
-    /// 流程：WPF BitmapImage 解码 → BGRA32 像素数组 → D3D11 Texture2D（Immutable） → SRV
-    /// 
-    /// 所有纹理在 D3DDeviceManager 持有的设备上创建（即 D3D11Image 的内部设备），
-    /// 确保后续 CopyResource / Dispatch 不会跨设备。
+    /// GPU 图片加载器。
+    ///
+    /// 它的职责是把磁盘上的常见图片格式转换成项目内部统一使用的 <see cref="GpuImage"/>：
+    /// 1. 使用 WPF 解码器读取图片；
+    /// 2. 转成 BGRA32 像素排列；
+    /// 3. 上传为 D3D11 纹理；
+    /// 4. 创建供 Compute Shader 使用的 SRV。
+    ///
+    /// 这里选用 WPF 的解码链路，是因为它对常见桌面图片格式支持完整，
+    /// 同时能方便地在导入时直接做 DecodePixelWidth 缩放，减少 CPU 和 GPU 压力。
     /// </summary>
     public class GpuImageLoader : IDisposable
     {
@@ -30,7 +34,8 @@ namespace GPUStitch.Core
 
 
         /// <summary>
-        /// 从文件路径加载图片到 GPU 纹理
+        /// 按原始尺寸把图片加载到 GPU。
+        /// 这是对 <see cref="LoadFromFile(string, float)"/> 的便捷封装。
         /// </summary>
         public GpuImage LoadFromFile(string filePath)
         {
@@ -39,16 +44,19 @@ namespace GPUStitch.Core
 
         /// <summary>
         /// 按指定缩放比例加载图片到 GPU。
-        /// 该方法用于“大批量预览模式”：
-        /// - 先按预算统一算出一个缩放比例；
-        /// - 再以同一比例加载所有图片，避免显存/内存被一次性打爆。
+        ///
+        /// 该方法是“预算驱动导入”的真正执行点：
+        /// - 外层先根据元数据算出统一 scale；
+        /// - 这里再按同一 scale 解码每一张图片；
+        /// - 最终所有预览纹理都处于同一几何尺度，便于配准和布局。
         /// </summary>
         public GpuImage LoadFromFile(string filePath, float scale)
         {
             if (!File.Exists(filePath))
                 throw new FileNotFoundException($"图片文件不存在: {filePath}");
 
-            // 用 WPF 解码图片并转为 BGRA32
+            // 先让 WPF 完成格式解码。
+            // 当 scale < 1 时，直接在解码阶段降采样，比解码完整图再缩放更省资源。
             var bitmap = new BitmapImage();
             bitmap.BeginInit();
             bitmap.UriSource = new Uri(filePath, UriKind.Absolute);
@@ -62,6 +70,7 @@ namespace GPUStitch.Core
             bitmap.EndInit();
             bitmap.Freeze();
 
+            // 统一转成 BGRA32，保证后续上传到 GPU 时像素格式稳定可控。
             var convertedBitmap = new FormatConvertedBitmap(
                 bitmap, System.Windows.Media.PixelFormats.Bgra32, null, 0);
 
@@ -95,7 +104,10 @@ namespace GPUStitch.Core
         }
 
         /// <summary>
-        /// 从 BGRA32 像素数据创建 GPU 纹理 + SRV
+        /// 从 BGRA32 像素数组创建不可变纹理和对应 SRV。
+        ///
+        /// 这里使用 Immutable 纹理，是因为源图上传后不会再被 CPU 改写，
+        /// 这样驱动可以用更适合只读采样的资源布局去管理它。
         /// </summary>
         internal unsafe GpuImage CreateTextureFromPixels(byte[] pixels, int width, int height, int stride)
         {
@@ -141,43 +153,5 @@ namespace GPUStitch.Core
             _disposed = true;
             GC.SuppressFinalize(this);
         }
-    }
-
-    /// <summary>
-    /// GPU 图片数据：持有 D3D11 纹理和 SRV，使用后需 Dispose
-    /// </summary>
-    public class GpuImage : IDisposable
-    {
-        public ID3D11Texture2D Texture { get; set; } = null!;
-        public ID3D11ShaderResourceView ShaderResourceView { get; set; } = null!;
-        public int Width { get; set; }
-        public int Height { get; set; }
-        public string FilePath { get; set; } = string.Empty;
-
-        public void Dispose()
-        {
-            ShaderResourceView?.Dispose();
-            Texture?.Dispose();
-            GC.SuppressFinalize(this);
-        }
-    }
-
-    /// <summary>
-    /// 图片文件元数据。
-    /// 当前只保存预算所需的最小信息：路径、宽高和源图估算字节数。
-    /// </summary>
-    public sealed class ImageFileMetadata
-    {
-        public ImageFileMetadata(string filePath, int pixelWidth, int pixelHeight)
-        {
-            FilePath = filePath;
-            PixelWidth = pixelWidth;
-            PixelHeight = pixelHeight;
-        }
-
-        public string FilePath { get; }
-        public int PixelWidth { get; }
-        public int PixelHeight { get; }
-        public long EstimatedSourceBytes => (long)PixelWidth * PixelHeight * 4L;
     }
 }
