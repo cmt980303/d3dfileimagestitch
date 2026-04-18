@@ -10,6 +10,7 @@
 // correlation keeps working when images are heavily blurred.
 // ============================================================
 
+//
 cbuffer RegistrationParams : register(b0)
 {
     int   LeftWidth;

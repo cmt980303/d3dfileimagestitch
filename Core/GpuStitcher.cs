@@ -92,7 +92,9 @@ namespace GPUStitch.Core
             CreateSamplerState();
             CreateConstantBuffer();
         }
+        #region 创建初始化的准备动作
 
+     
         /// <summary>
         /// 编译 HLSL 计算着色器
         /// 从嵌入资源中读取 StitchCS.hlsl 并使用 D3DCompiler 编译
@@ -169,6 +171,8 @@ namespace GPUStitch.Core
 
             _constantBuffer = _deviceManager.Device.CreateBuffer(bufferDesc);
         }
+        #endregion
+
 
         /// <summary>
         /// 确保输出纹理的尺寸正确
@@ -370,7 +374,7 @@ namespace GPUStitch.Core
     /// Compute Shader 的常量缓冲区数据结构
     /// 必须与 HLSL 中的 cbuffer StitchParams 布局完全一致
     /// 使用 LayoutKind.Sequential 确保内存布局与 HLSL 对齐
-    /// 
+    /// 对应StitchCS.hlsl中的StitchConstants
     /// 注意：HLSL 常量缓冲区要求 16 字节对齐
     /// </summary>
     [StructLayout(LayoutKind.Sequential)]
