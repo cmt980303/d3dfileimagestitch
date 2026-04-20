@@ -21,11 +21,11 @@ namespace GPUStitch.Models
         /// <summary>预估垂直重叠高度。</summary>
         public int ExpectedVerticalOverlap { get; set; } = 100;
 
-        /// <summary>X 方向局部搜索半径。</summary>
-        public int SearchRangeX { get; set; } = 64;
+        /// <summary>主轴方向局部搜索半径（水平配准时为 X，垂直配准时为 Y）。</summary>
+        public int SearchRangePrimary { get; set; } = 64;
 
-        /// <summary>Y 方向局部搜索半径。</summary>
-        public int SearchRangeY { get; set; } = 32;
+        /// <summary>交叉轴方向局部搜索半径（水平配准时为 Y，垂直配准时为 X）。</summary>
+        public int SearchRangeCross { get; set; } = 32;
 
         /// <summary>采样步长。步长越大，速度越快，但细节利用越少。</summary>
         public int SampleStep { get; set; } = 2;
@@ -77,8 +77,8 @@ namespace GPUStitch.Models
                 minHeight = Math.Min(minHeight, images[i].Height);
             }
 
-            int searchRangeX = Clamp(expectedOverlap / 2, 16, 192);
-            int searchRangeY = Clamp(minHeight / 48, 6, 96);
+            int searchRangePrimary = Clamp(expectedOverlap / 2, 16, 192);
+            int searchRangeCross = Clamp(Math.Min(minWidth, minHeight) / 48, 6, 96);
             int sampleStep = minWidth >= 3500 || minHeight >= 3500 ? 3 : 2;
             int minSamples = sampleStep <= 2 ? 64 : 48;
             float minGradientEnergy = sampleStep <= 2 ? 0.00015f : 0.00010f;
@@ -88,8 +88,8 @@ namespace GPUStitch.Models
             {
                 ExpectedHorizontalOverlap = expectedOverlap,
                 ExpectedVerticalOverlap = expectedOverlap,
-                SearchRangeX = searchRangeX,
-                SearchRangeY = searchRangeY,
+                SearchRangePrimary = searchRangePrimary,
+                SearchRangeCross = searchRangeCross,
                 SampleStep = sampleStep,
                 MinSampleCount = minSamples,
                 MinGradientEnergy = minGradientEnergy,

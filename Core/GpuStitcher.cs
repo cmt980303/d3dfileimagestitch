@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.IO;
 using System.Reflection;
 using System.Runtime.InteropServices;
@@ -117,7 +118,7 @@ namespace GPUStitch.Core
         /// </summary>
         public void PrepareCanvas(int canvasWidth, int canvasHeight)
         {
-            // 渐进式路径与一次性路径共享同一套资源，只是不在这里立刻累加全部图像。
+            Debug.WriteLine($"[Stitch] PrepareCanvas: {canvasWidth}x{canvasHeight}, BlendWidth={BlendWidth:F1}");
             EnsureOutputResources(canvasWidth, canvasHeight);
             ClearAccumulationTexture();
         }
@@ -128,6 +129,10 @@ namespace GPUStitch.Core
         /// </summary>
         public void AccumulateImage(GpuImage image, ImagePlacement placement)
         {
+            Debug.WriteLine(
+                $"[Stitch] Accumulate: offset=({placement.OffsetX:F1},{placement.OffsetY:F1}), " +
+                $"size=({placement.Width:F1},{placement.Height:F1}), " +
+                $"feather=L{placement.FeatherLeft:F0}/R{placement.FeatherRight:F0}/T{placement.FeatherTop:F0}/B{placement.FeatherBottom:F0}");
             AccumulateSingleImage(image, placement);
         }
 

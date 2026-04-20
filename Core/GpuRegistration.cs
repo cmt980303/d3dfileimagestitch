@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.IO;
 using System.Reflection;
 using System.Runtime.InteropServices;
@@ -69,10 +70,28 @@ namespace GPUStitch.Core
             if (images.Count == 0)
                 return RegistrationLayout.Empty;
 
-            if (TryComputeGridLayout(images, options, out var gridLayout))
-                return gridLayout;
+            Debug.WriteLine(
+                $"[Registration] === 开始配准 {images.Count} 张图片 ===\n" +
+                $"  水平重叠={options.ExpectedHorizontalOverlap}, 垂直重叠={options.ExpectedVerticalOverlap}\n" +
+                $"  搜索范围: primary={options.SearchRangePrimary}, cross={options.SearchRangeCross}\n" +
+                $"  置信阈值={options.ConfidenceThreshold}");
 
-            return ComputeSequentialHorizontalLayout(images, options);
+            if (TryComputeGridLayout(images, options, out var gridLayout))
+            {
+                Debug.WriteLine(
+                    $"[Registration] === 网格布局完成: {gridLayout.CanvasWidth}x{gridLayout.CanvasHeight}, " +
+                    $"可信 {gridLayout.ConfidentPairCount}/{gridLayout.PairResults.Count}, " +
+                    $"平均分 {gridLayout.AverageScore:F4} ===");
+                return gridLayout;
+            }
+
+            Debug.WriteLine("[Registration] 网格布局失败，回退到顺序水平布局");
+            var seqLayout = ComputeSequentialHorizontalLayout(images, options);
+            Debug.WriteLine(
+                $"[Registration] === 顺序布局完成: {seqLayout.CanvasWidth}x{seqLayout.CanvasHeight}, " +
+                $"可信 {seqLayout.ConfidentPairCount}/{seqLayout.PairResults.Count}, " +
+                $"平均分 {seqLayout.AverageScore:F4} ===");
+            return seqLayout;
         }
 
         /// <summary>
@@ -106,11 +125,26 @@ namespace GPUStitch.Core
                 ? Clamp(options.ExpectedHorizontalOverlap, 8, Math.Min(first.Width, second.Width) - 2)
                 : Clamp(options.ExpectedVerticalOverlap, 8, Math.Min(first.Height, second.Height) - 2);
 
-            int candidateCountX = options.SearchRangeX * 2 + 1;
-            int candidateCountY = options.SearchRangeY * 2 + 1;
+            // 根据配准方向分配搜索范围：
+            // 水平配准(左→右)：X 是主轴(大范围)，Y 是交叉轴(小范围)
+            // 垂直配准(上→下)：Y 是主轴(大范围)，X 是交叉轴(小范围)
+            int searchRangeX, searchRangeY;
+            if (axis == RegistrationAxis.Horizontal)
+            {
+                searchRangeX = options.SearchRangePrimary;
+                searchRangeY = options.SearchRangeCross;
+            }
+            else
+            {
+                searchRangeX = options.SearchRangeCross;
+                searchRangeY = options.SearchRangePrimary;
+            }
+
+            int candidateCountX = searchRangeX * 2 + 1;
+            int candidateCountY = searchRangeY * 2 + 1;
 
             EnsureScoreTextures(candidateCountX, candidateCountY);
-            UpdateConstants(first, second, overlapSize, options, axis);
+            UpdateConstants(first, second, overlapSize, searchRangeX, searchRangeY, options, axis);
 
             var ctx = _deviceManager.Context;
             ctx.CSSetShader(_computeShader);
@@ -170,7 +204,7 @@ namespace GPUStitch.Core
                 }
             }
 
-            return new PairRegistrationResult(
+            var result = new PairRegistrationResult(
                 sourceIndex,
                 targetIndex,
                 axis,
@@ -181,6 +215,15 @@ namespace GPUStitch.Core
                 relativeOffsetX,
                 relativeOffsetY,
                 isConfident);
+
+            Debug.WriteLine(
+                $"[Registration] 配准 [{sourceIndex}]->[{targetIndex}] {axis}: " +
+                $"score={best.Score:F4}, delta=({best.BestDeltaX},{best.BestDeltaY}), " +
+                $"offset=({relativeOffsetX},{relativeOffsetY}), overlap={overlapSize}, " +
+                $"search=({searchRangeX},{searchRangeY}), " +
+                $"confident={isConfident}{(isConfident ? "" : " [FALLBACK]")}");
+
+            return result;
         }
 
         /// <summary>
@@ -327,14 +370,16 @@ namespace GPUStitch.Core
             float nominalStepX = EstimateNominalHorizontalStep(images, options);
             float nominalStepY = EstimateNominalVerticalStep(images, options);
 
-            // 第四步：把局部边位移传播为全局坐标。
-            // 如果图不完全连通，则使用名义步长给新的连通分量一个保守起点。
+            // 第四步：先用 BFS 生成初始全局坐标，再用加权最小二乘全局优化精炼。
+            // BFS 的问题是每个节点只从一条路径获取位置，冗余约束被丢弃。
+            // 全局优化会同时考虑所有配准边，让多条路径的误差互相抵消。
             var positionsX = new float[images.Count];
             var positionsY = new float[images.Count];
             var visited = new bool[images.Count];
             var queue = new Queue<int>();
             var anchorCoordinate = coordinates[sortedIndices[0]];
 
+            // BFS 初始化（和之前逻辑一致）
             for (int i = 0; i < sortedIndices.Count; i++)
             {
                 int seedIndex = sortedIndices[i];
@@ -374,8 +419,136 @@ namespace GPUStitch.Core
                 }
             }
 
+            // 第五步：加权最小二乘全局优化
+            // 以 BFS 结果为初始值，迭代优化使所有边约束的加权残差平方和最小。
+            // 锚点（sortedIndices[0]）固定在 (0,0) 不参与优化。
+            Debug.WriteLine("[Registration] BFS 初始坐标:");
+            for (int i = 0; i < images.Count; i++)
+            {
+                Debug.WriteLine($"  图[{i}] ({coordinates[i]}): ({positionsX[i]:F1}, {positionsY[i]:F1})");
+            }
+
+            RefinePositionsGlobalLeastSquares(
+                positionsX, positionsY, pairResults, images.Count, sortedIndices[0]);
+
+            Debug.WriteLine("[Registration] 全局优化后坐标:");
+            for (int i = 0; i < images.Count; i++)
+            {
+                Debug.WriteLine($"  图[{i}] ({coordinates[i]}): ({positionsX[i]:F1}, {positionsY[i]:F1})");
+            }
+
             layout = BuildLayoutFromPositions(images, positionsX, positionsY, pairResults);
             return true;
+        }
+
+        /// <summary>
+        /// 加权最小二乘全局位置优化。
+        ///
+        /// 原理：每条配准边提供一个约束 "pos[target] - pos[source] ≈ (offsetX, offsetY)"。
+        /// 我们要找到一组全局坐标使所有约束的加权残差平方和最小：
+        ///   min Σ w_e * ||(pos[t] - pos[s]) - (dx_e, dy_e)||²
+        ///
+        /// 这等价于求解一个稀疏线性方程组 L * pos = b，其中 L 是图的加权拉普拉斯矩阵。
+        /// 由于锚点固定，我们用迭代法（加权 Jacobi）求解，简单且对这个规模足够快。
+        ///
+        /// 权重策略：置信配准边权重 = score²（分数越高越可靠），
+        /// 不置信边权重大幅降低，避免错误配准污染全局布局。
+        /// </summary>
+        private static void RefinePositionsGlobalLeastSquares(
+            float[] positionsX,
+            float[] positionsY,
+            List<PairRegistrationResult> pairResults,
+            int nodeCount,
+            int anchorIndex)
+        {
+            if (pairResults.Count == 0 || nodeCount <= 1)
+                return;
+
+            const int maxIterations = 200;
+            const float convergenceThreshold = 0.01f;
+            const float lowConfidenceWeight = 0.05f;
+
+            // 为每条边计算权重
+            var edgeWeights = new float[pairResults.Count];
+            for (int e = 0; e < pairResults.Count; e++)
+            {
+                var pr = pairResults[e];
+                if (pr.IsConfident && pr.Score > 0)
+                {
+                    // 高置信边：权重 = score²，放大高分边的影响
+                    edgeWeights[e] = pr.Score * pr.Score;
+                }
+                else
+                {
+                    // 低置信边：保留微弱约束防止孤立节点漂移，但不主导布局
+                    edgeWeights[e] = lowConfidenceWeight;
+                }
+            }
+
+            var newX = new float[nodeCount];
+            var newY = new float[nodeCount];
+
+            for (int iter = 0; iter < maxIterations; iter++)
+            {
+                // 每个节点收集所有相邻边的加权约束，计算新位置
+                Array.Copy(positionsX, newX, nodeCount);
+                Array.Copy(positionsY, newY, nodeCount);
+
+                float maxShift = 0;
+
+                for (int node = 0; node < nodeCount; node++)
+                {
+                    if (node == anchorIndex)
+                        continue;
+
+                    float sumWeightedX = 0;
+                    float sumWeightedY = 0;
+                    float sumWeight = 0;
+
+                    for (int e = 0; e < pairResults.Count; e++)
+                    {
+                        var pr = pairResults[e];
+                        float w = edgeWeights[e];
+
+                        if (pr.SourceIndex == node)
+                        {
+                            // 这条边说: pos[node] = pos[target] - (offsetX, offsetY)
+                            sumWeightedX += w * (positionsX[pr.TargetIndex] - pr.RelativeOffsetX);
+                            sumWeightedY += w * (positionsY[pr.TargetIndex] - pr.RelativeOffsetY);
+                            sumWeight += w;
+                        }
+                        else if (pr.TargetIndex == node)
+                        {
+                            // 这条边说: pos[node] = pos[source] + (offsetX, offsetY)
+                            sumWeightedX += w * (positionsX[pr.SourceIndex] + pr.RelativeOffsetX);
+                            sumWeightedY += w * (positionsY[pr.SourceIndex] + pr.RelativeOffsetY);
+                            sumWeight += w;
+                        }
+                    }
+
+                    if (sumWeight > 1e-8f)
+                    {
+                        newX[node] = sumWeightedX / sumWeight;
+                        newY[node] = sumWeightedY / sumWeight;
+
+                        float dx = newX[node] - positionsX[node];
+                        float dy = newY[node] - positionsY[node];
+                        float shift = dx * dx + dy * dy;
+                        if (shift > maxShift)
+                            maxShift = shift;
+                    }
+                }
+
+                Array.Copy(newX, positionsX, nodeCount);
+                Array.Copy(newY, positionsY, nodeCount);
+
+                if (maxShift < convergenceThreshold * convergenceThreshold)
+                {
+                    System.Diagnostics.Debug.WriteLine(
+                        $"[Registration] 全局优化在第 {iter + 1} 轮收敛 (maxShift={Math.Sqrt(maxShift):F4}px)");
+                    break;
+                }
+            }
         }
 
         private static void AddBidirectionalEdge(
@@ -535,14 +708,18 @@ namespace GPUStitch.Core
             _scoreReadbackTexture = _deviceManager.Device.CreateTexture2D(readbackDesc);
         }
 
+
         private void UpdateConstants(
             GpuImage first,
             GpuImage second,
             int overlapSize,
+            int searchRangeX,
+            int searchRangeY,
             RegistrationOptions options,
             RegistrationAxis axis)
         {
-            // 常量缓冲区把 CPU 侧“候选搜索问题”的全部描述一次性送到 GPU。
+            Debug.WriteLine(
+                $"[Reg] UpdateConstants: overlap={overlapSize}, rangeX={searchRangeX}, rangeY={searchRangeY}, axis={axis}");
             var constants = new RegistrationConstants
             {
                 FirstWidth = first.Width,
@@ -550,8 +727,8 @@ namespace GPUStitch.Core
                 SecondWidth = second.Width,
                 SecondHeight = second.Height,
                 OverlapSize = overlapSize,
-                SearchRangeX = options.SearchRangeX,
-                SearchRangeY = options.SearchRangeY,
+                SearchRangeX = searchRangeX,
+                SearchRangeY = searchRangeY,
                 SampleStep = options.SampleStep,
                 Orientation = (int)axis,
                 MinSampleCount = options.MinSampleCount,
