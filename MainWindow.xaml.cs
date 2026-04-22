@@ -58,7 +58,7 @@ namespace GPUStitch
         /// 同时并发解码/上传的图片数量。
         /// 这里故意保持较低并发，目的是降低磁盘、CPU 解码和显存上传同时峰值。
         /// </summary>
-        private const int MaxParallelLoads = 2;
+        private const int MaxParallelLoads = 10;
 
         // ===== GPU 核心模块 =====
         private D3DDeviceManager? _deviceManager;
@@ -188,7 +188,7 @@ namespace GPUStitch
                 if (_loadCts.IsCancellationRequested)
                     return;
 
-                ApplyRecommendedParameters(showStatus: false);
+                await ApplyRecommendedParametersAsync(showStatus: false);
                 BtnStitch.IsEnabled = GetLoadedImagesInOrder().Count >= 2;
                 BtnRecommend.IsEnabled = GetLoadedImagesInOrder().Count >= 2;
                 BtnShowSingle.IsEnabled = GetLoadedImagesInOrder().Count >= 1;
@@ -307,7 +307,7 @@ namespace GPUStitch
             }
         }
 
-        private void BtnRecommend_Click(object sender, RoutedEventArgs e)
+        private async void BtnRecommend_Click(object sender, RoutedEventArgs e)
         {
             if (_isLoading)
             {
@@ -321,7 +321,7 @@ namespace GPUStitch
                 return;
             }
 
-            ApplyRecommendedParameters(showStatus: true);
+            await ApplyRecommendedParametersAsync(showStatus: true);
         }
 
         /// <summary>
@@ -939,10 +939,13 @@ namespace GPUStitch
         /// 基于当前已加载图片自动推荐重叠宽度和混合宽度。
         /// 这一步不会改动布局本身，只更新 UI 滑块的建议值。
         /// </summary>
-        private void ApplyRecommendedParameters(bool showStatus)
+        private async Task ApplyRecommendedParametersAsync(bool showStatus)
         {
             var loadedImages = GetLoadedImagesInOrder();
-            var recommendation = StitchParameterAdvisor.Recommend(loadedImages);
+            if (showStatus)
+                UpdateStatus($"已加载 {loadedImages.Count} 张图片，正在估计推荐参数...");
+
+            var recommendation = await Task.Run(() => StitchParameterAdvisor.Recommend(loadedImages));
             if (recommendation.OverlapPixels <= 0)
             {
                 if (showStatus)

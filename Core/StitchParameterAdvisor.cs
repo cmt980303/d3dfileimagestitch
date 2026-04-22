@@ -22,6 +22,11 @@ namespace GPUStitch.Core
     /// </summary>
     public static class StitchParameterAdvisor
     {
+        private const int MaxPreviewCacheEntries = 128;
+        private static readonly object PreviewCacheLock = new object();
+        private static readonly Dictionary<string, PreviewImage> PreviewCache =
+            new Dictionary<string, PreviewImage>(StringComparer.OrdinalIgnoreCase);
+
         /// <summary>
         /// 对当前图片集合给出一组推荐参数。
         /// </summary>
@@ -69,10 +74,11 @@ namespace GPUStitch.Core
                     continue;
                 }
 
-                var left = LoadPreview(images[i - 1].FilePath, 512);
-                var right = LoadPreview(images[i].FilePath, 512);
+                var left = GetOrLoadPreview(images[i - 1].FilePath, 512);
+                var right = GetOrLoadPreview(images[i].FilePath, 512);
                 if (left.Width < 32 || right.Width < 32 || left.Height < 32 || right.Height < 32)
                     continue;
+
 
                 var estimate = EstimatePairOverlap(
                     left,
@@ -113,6 +119,29 @@ namespace GPUStitch.Core
                 Confidence = scoreCount > 0 ? scoreSum / scoreCount : 0,
                 EvaluatedPairCount = scoreCount,
             };
+        }
+
+        private static PreviewImage GetOrLoadPreview(string filePath, int maxDimension)
+        {
+            lock (PreviewCacheLock)
+            {
+                if (PreviewCache.TryGetValue(filePath, out var cached))
+                    return cached;
+            }
+
+            var loaded = LoadPreview(filePath, maxDimension);
+
+            lock (PreviewCacheLock)
+            {
+                if (PreviewCache.TryGetValue(filePath, out var cached))
+                    return cached;
+
+                if (PreviewCache.Count >= MaxPreviewCacheEntries)
+                    PreviewCache.Clear();
+
+                PreviewCache[filePath] = loaded;
+                return loaded;
+            }
         }
 
         /// <summary>
@@ -214,38 +243,51 @@ namespace GPUStitch.Core
         /// </summary>
         private static PreviewImage LoadPreview(string filePath, int maxDimension)
         {
-            var bitmap = new BitmapImage();
-            bitmap.BeginInit();
-            bitmap.UriSource = new Uri(filePath, UriKind.Absolute);
-            bitmap.CacheOption = BitmapCacheOption.OnLoad;
-            bitmap.EndInit();
-            bitmap.Freeze();
+            int originalWidth, originalHeight;
 
-            var gray = new FormatConvertedBitmap(bitmap, PixelFormats.Gray8, null, 0);
-            gray.Freeze();
-
-            double scale = Math.Min(
-                1.0,
-                maxDimension / (double)Math.Max(gray.PixelWidth, gray.PixelHeight));
-
-            BitmapSource source = gray;
-            if (scale < 0.999)
+            // 使用 FileStream 可以确保读取完毕后立即释放文件句柄
+            using (var stream = new FileStream(filePath, FileMode.Open, FileAccess.Read, FileShare.Read))
             {
-                var transform = new ScaleTransform(scale, scale);
-                var scaled = new TransformedBitmap(gray, transform);
-                scaled.Freeze();
-                source = scaled;
+                // 1. 仅读取图像元数据，不解码像素（DelayCreation），几乎瞬间完成
+                var decoder = BitmapDecoder.Create(stream, BitmapCreateOptions.DelayCreation, BitmapCacheOption.None);
+                originalWidth = decoder.Frames[0].PixelWidth;
+                originalHeight = decoder.Frames[0].PixelHeight;
+
+                // 重置流位置，供接下来的实际解码使用
+                stream.Position = 0;
+
+                // 2. 利用 WIC 底层机制，在解码加载时直接缩小图像
+                var bitmap = new BitmapImage();
+                bitmap.BeginInit();
+                bitmap.StreamSource = stream;
+                bitmap.CacheOption = BitmapCacheOption.OnLoad; // 确保加载后释放流缓存
+
+                if (originalWidth > maxDimension || originalHeight > maxDimension)
+                {
+                    // 仅需设置较长的一边，WPF 会自动帮你保持图像的正确宽高比
+                    if (originalWidth > originalHeight)
+                        bitmap.DecodePixelWidth = maxDimension;
+                    else
+                        bitmap.DecodePixelHeight = maxDimension;
+                }
+
+                bitmap.EndInit();
+                bitmap.Freeze();
+
+                // 3. 此时的 bitmap 已经是缩小后的尺寸了，对其进行灰度转换的计算量呈指数级下降
+                var gray = new FormatConvertedBitmap(bitmap, PixelFormats.Gray8, null, 0);
+                gray.Freeze();
+
+                // 4. 提取像素数据
+                int width = gray.PixelWidth;
+                int height = gray.PixelHeight;
+                int stride = width; // Gray8 格式每像素1字节，stride 即为 width
+                byte[] pixels = new byte[height * stride];
+                gray.CopyPixels(pixels, stride, 0);
+
+                return new PreviewImage(width, height, pixels);
             }
-
-            int width = source.PixelWidth;
-            int height = source.PixelHeight;
-            int stride = width;
-            byte[] pixels = new byte[height * stride];
-            source.CopyPixels(pixels, stride, 0);
-
-            return new PreviewImage(width, height, pixels);
         }
-
         private static int Clamp(int value, int min, int max)
         {
             if (max < min)
