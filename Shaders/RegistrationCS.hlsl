@@ -124,32 +124,40 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID)
     float sumSecondGradient = 0.0;
     int gradientSampleCount = 0;
 
-    float sumFirstLuma = 0.0;
-    float sumSecondLuma = 0.0;
-    float sumFirstLuma2 = 0.0;
-    float sumSecondLuma2 = 0.0;
-    float sumCrossLuma = 0.0;
+    // Accumulate luma statistics with online mean/variance/covariance updates
+    // to avoid catastrophic cancellation in the single-pass ZNCC formula.
+    float meanFirstLuma = 0.0;
+    float meanSecondLuma = 0.0;
+    float firstLumaM2 = 0.0;
+    float secondLumaM2 = 0.0;
+    float lumaCovariance = 0.0;
     int lumaSampleCount = 0;
+    int sampleStep = max(SampleStep, 1);
 
     [loop]
-    for (int y = yStart; y < yEnd; y += max(SampleStep, 1))
+    for (int y = yStart; y < yEnd; y += sampleStep)
     {
         [loop]
-        for (int x = xStart; x < xEnd; x += max(SampleStep, 1))
+        for (int x = xStart; x < xEnd; x += sampleStep)
         {
             int2 secondPixel;
             if (!ComputeSecondPixel(x, y, deltaX, deltaY, secondPixel))
                 continue;
 
-            float firstLuma = SampleLuma(FirstImage, int2(x, y));
-            float secondLuma = SampleLuma(SecondImage, secondPixel);
+            // Shift the luma distribution closer to zero before the Welford update.
+            // This keeps intermediate values smaller and further reduces precision loss.
+            float firstLuma = SampleLuma(FirstImage, int2(x, y)) - 0.5f;
+            float secondLuma = SampleLuma(SecondImage, secondPixel) - 0.5f;
 
-            sumFirstLuma += firstLuma;
-            sumSecondLuma += secondLuma;
-            sumFirstLuma2 += firstLuma * firstLuma;
-            sumSecondLuma2 += secondLuma * secondLuma;
-            sumCrossLuma += firstLuma * secondLuma;
             lumaSampleCount++;
+            float sampleCountF = (float)lumaSampleCount;
+            float firstDelta = firstLuma - meanFirstLuma;
+            meanFirstLuma += firstDelta / sampleCountF;
+            float secondDelta = secondLuma - meanSecondLuma;
+            meanSecondLuma += secondDelta / sampleCountF;
+            firstLumaM2 += firstDelta * (firstLuma - meanFirstLuma);
+            secondLumaM2 += secondDelta * (secondLuma - meanSecondLuma);
+            lumaCovariance += firstDelta * (secondLuma - meanSecondLuma);
 
             float2 firstGradient = ComputeGradient(FirstImage, int2(x, y));
             float2 secondGradient = ComputeGradient(SecondImage, secondPixel);
@@ -167,7 +175,7 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID)
         }
     }
 
-    float score = -1.0;
+    float finalScore = -1.0;
 
     float gradientScore = -2.0;
     if (gradientSampleCount >= max(MinSampleCount / 2, 16) &&
@@ -179,14 +187,13 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID)
     float lumaScore = -2.0;
     if (lumaSampleCount >= MinSampleCount)
     {
-        float sampleCountF = (float)lumaSampleCount;
-        float numerator = sumCrossLuma - ((sumFirstLuma * sumSecondLuma) / sampleCountF);
-        float firstVariance = sumFirstLuma2 - ((sumFirstLuma * sumFirstLuma) / sampleCountF);
-        float secondVariance = sumSecondLuma2 - ((sumSecondLuma * sumSecondLuma) / sampleCountF);
+        float numerator = lumaCovariance;
+        float firstVariance = firstLumaM2;
+        float secondVariance = secondLumaM2;
 
         if (firstVariance > MinLumaVariance && secondVariance > MinLumaVariance)
         {
-            lumaScore = numerator * rsqrt(firstVariance * secondVariance);
+            lumaScore = numerator * rsqrt(max(firstVariance * secondVariance, 1e-12));
         }
     }
 
@@ -196,16 +203,16 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID)
     if (hasGradientScore && hasLumaScore)
     {
         float totalWeight = max(GradientWeight + LumaWeight, 1e-5);
-        score = ((gradientScore * GradientWeight) + (lumaScore * LumaWeight)) / totalWeight;
+        finalScore = ((gradientScore * GradientWeight) + (lumaScore * LumaWeight)) / totalWeight;
     }
     else if (hasGradientScore)
     {
-        score = gradientScore;
+        finalScore = gradientScore;
     }
     else if (hasLumaScore)
     {
-        score = lumaScore;
+        finalScore = lumaScore;
     }
 
-    ScoreMap[int2(candidateX, candidateY)] = score;
+    ScoreMap[int2(candidateX, candidateY)] = finalScore;
 }

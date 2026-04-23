@@ -718,8 +718,9 @@ namespace GPUStitch.Core
             RegistrationOptions options,
             RegistrationAxis axis)
         {
+            int effectiveSampleStep = GetEffectiveSampleStep(first, second, overlapSize, axis, options.SampleStep);
             Debug.WriteLine(
-                $"[Reg] UpdateConstants: overlap={overlapSize}, rangeX={searchRangeX}, rangeY={searchRangeY}, axis={axis}");
+                $"[Reg] UpdateConstants: overlap={overlapSize}, rangeX={searchRangeX}, rangeY={searchRangeY}, axis={axis}, sampleStep={effectiveSampleStep}");
             var constants = new RegistrationConstants
             {
                 FirstWidth = first.Width,
@@ -729,7 +730,7 @@ namespace GPUStitch.Core
                 OverlapSize = overlapSize,
                 SearchRangeX = searchRangeX,
                 SearchRangeY = searchRangeY,
-                SampleStep = options.SampleStep,
+                SampleStep = effectiveSampleStep,
                 Orientation = (int)axis,
                 MinSampleCount = options.MinSampleCount,
                 MinGradientEnergy = options.MinGradientEnergy,
@@ -741,6 +742,36 @@ namespace GPUStitch.Core
             var mapped = _deviceManager.Context.Map(_constantBuffer!, MapMode.WriteDiscard);
             Marshal.StructureToPtr(constants, mapped.DataPointer, false);
             _deviceManager.Context.Unmap(_constantBuffer!, 0);
+        }
+
+        /// <summary>
+        /// 当重叠区域很大时，自动提高实际采样步长，减少单精度累加误差并降低 shader 压力。
+        /// 这里不会覆盖用户显式给出的更大步长，只会把过小的步长抬到一个更稳妥的下限。
+        /// </summary>
+        private static int GetEffectiveSampleStep(
+            GpuImage first,
+            GpuImage second,
+            int overlapSize,
+            RegistrationAxis axis,
+            int requestedSampleStep)
+        {
+            int effectiveSampleStep = Math.Max(1, requestedSampleStep);
+            int crossAxisLength = axis == RegistrationAxis.Horizontal
+                ? Math.Min(first.Height, second.Height)
+                : Math.Min(first.Width, second.Width);
+
+            long overlapArea = (long)Math.Max(overlapSize, 1) * Math.Max(crossAxisLength, 1);
+            if (overlapArea >= 160000)
+            {
+                return Math.Max(effectiveSampleStep, 3);
+            }
+
+            if (overlapArea >= 40000)
+            {
+                return Math.Max(effectiveSampleStep, 2);
+            }
+
+            return effectiveSampleStep;
         }
 
         private BestScoreResult ReadBestScore(int width, int height)

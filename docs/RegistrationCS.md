@@ -10,7 +10,80 @@
 这意味着它本质上在做一件事：
 
 > 把“给定搜索窗口内每个候选偏移的匹配质量”并行评估出来。
+分治评估： 这段 Compute Shader 在一个 2D 线程网格上运行。每个线程对应一个“候选偏移量”（Candidate Offset），这就像每一个 GPU 核心都在独立计算一种配准可能性。
 
+确定重叠边界： 根据配准的方向（水平或垂直）以及当前候选偏移量，计算第一张图像中与第二张图像发生重叠的区域（由 ComputeOverlapBounds 完成）。
+
+计算对应像素： 对于第一张图像重叠区域内的每个像素，计算其在第二张图像中对应的像素坐标（由 ComputeSecondPixel 完成）。
+
+混合得分计算： 代码采用了一种“混合”策略，结合了两种独立的得分机制：
+
+亮度得分 (Luma Score): 基于标准化互相关 (NCC)。它评估两个重叠区域在像素亮度上的相关性。得分越接近 1.0，表示亮度越匹配。
+
+梯度得分 (Gradient Score): 基于归一化交叉梯度 (NCG)。它首先计算像素的梯度向量（gx, gy），然后计算重叠区域内对应像素梯度向量的归一化点积。这种方法强调图像的边缘和结构匹配。
+
+阈值筛选与权重混合： 代码会检查样本数和方差/能量是否足够大（MinGradientEnergy, MinLumaVariance），以避免在低纹理区域计算得分。最终得分是亮度得分和梯度得分的加权平均（GradientWeight, LumaWeight）。
+
+输出 ScoreMap： 计算出的混合得分（-1.0 到 1.0）被写入一个 2D RWTexture (ScoreMap) 中，其 X 和 Y 坐标对应候选偏移量。ScoreMap 中的最大值即代表图像配准的最佳偏移量。
+
+  
+1. 数据接口与参数定义 
+(Data & Parameters)这个模块负责定义 CPU 传给 GPU 的数据，相当于函数的“输入参数”。
+cbuffer RegistrationParams (常量缓冲区): 这里存放了配准任务的所有全局配置。CPU 会在运行 Shader 前把这些值填好。
+尺寸与范围: FirstWidth/Height 等定义了图像大小；
+
+SearchRangeX/Y 定义了探索偏移量的最大范围；
+
+OverlapSize 定义了理论上的重叠区域大小。
+
+控制开关: Orientation 决定是横向还是纵向拼接；
+
+SampleStep 允许跳跃采样以提升性能（例如只采样一半的像素）。
+
+阈值与权重:MinGradientEnergy、MinLumaVariance 用于过滤掉没有纹理的平坦区域（比如纯蓝天），避免算出无意义的得分；
+
+GradientWeight 和 LumaWeight 则决定了最终得分中梯度和亮度的占比。
+
+Texture2D & RWTexture2D (纹理绑定):FirstImage 和 SecondImage 是只读的输入图片。
+
+ScoreMap 是输出资源（RW 代表 Read/Write）。
+
+每个 GPU 线程计算出的最终得分，都会写入这幅“得分图”对应的像素点里。
+
+2. 基础图像特征提取 (Feature Extraction)这个模块包含几个辅助函数，用于提取像素层面的基本特征，供后续打分使用。
+ToLuma & SampleLuma:将 RGB 彩色像素转换为单通道的灰度值 (Luma)。
+
+公式 $0.299R + 0.587G + 0.114B$ 是标准的亮度感知转换公式。
+
+在灰度图上进行配准，能大幅减少 GPU 的内存带宽消耗和计算量。
+
+ComputeGradient:计算指定像素的二维梯度向量。
+
+它使用中心差分法（即用右边像素减左边，下边减上边）。
+返回的 float2(gx, gy) 代表了该像素点处边缘的强度和方向。
+    
+3. 几何边界与坐标映射 (Geometry & Mapping)因为两张图片是错开的，
+这个模块负责在数学上把它们“对齐”，找出需要采样的公共区域。
+ComputeOverlapBounds:给定当前线程正在评估的偏移量 (deltaX, deltaY)，计算出第一张图中哪些区域会和第二张图重叠。
+
+它会根据 Orientation (拼接方向) 输出 [xStart, xEnd] 和 [yStart, yEnd]，作为后续循环的边界。
+ComputeSecondPixel:坐标转换核心。
+当你拿到第一张图重叠区域里的一个像素坐标 (firstX, firstY) 时，这个函数能帮你算出它在第二张图里对应的物理坐标。
+同时，它还会检查算出的坐标是否超出了第二张图的边界（越界保护）。
+
+
+4. GPU 线程主入口 (CSMain)这是 Compute Shader 的心脏，每个 GPU 线程（对应一种 deltaX, deltaY 偏移组合）都会独立执行这个函数。
+线程 ID 映射与越界剔除:High-level shader languageint candidateX = (int)dispatchThreadId.x;
+int deltaX = candidateX - SearchRangeX;
+GPU 线程是按网格分布的。代码首先将当前线程的 ID 转换为实际的偏移量 deltaX 和 deltaY。如果线程 ID 超出了设定的搜索范围，直接 return 结束运算。
+核心采样循环 (The Core Loop):High-level shader language[loop]
+for (int y = yStart; y < yEnd; y += max(SampleStep, 1))
+这就是性能开销最大的部分。线程会在计算出的重叠区域内遍历像素。
+
+在循环内部，它：采样两张图的亮度，并累加 $X$, $Y$, $X^2$, $Y^2$, $X \cdot Y$ （用于后续极其快速的方差和协方差计算）。
+采样两张图的梯度，计算梯度能量（点积的平方）。如果能量太低（即该区域没有明显边缘），则跳过梯度得分的累加，防止噪声干扰。
+累加两张图梯度的点积（用于计算归一化交叉梯度）。
+得分计算与合成:循环结束后，利用累加好的统计数据，进行最终的数学计算：梯度得分 (gradientScore): 利用归一化点积公式计算，反映边缘走向的一致性。亮度得分 (lumaScore): 也就是零均值归一化互相关 (ZNCC)。利用之前累加的各项数据，通过代数公式直接算出方差和相关性，极其巧妙地避开了二次遍历。混合输出: 根据参数中设定的权重 (GradientWeight, LumaWeight)，将两个得分融合成一个最终得分，并写入到 ScoreMap 的当前候选坐标中。
 ## 源码
 
 ```hlsl
