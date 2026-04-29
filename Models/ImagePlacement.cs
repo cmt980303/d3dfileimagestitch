@@ -6,7 +6,7 @@ namespace GPUStitch.Models
     /// 这个类型是拼接阶段最核心的几何模型之一：
     /// 1. OffsetX / OffsetY 表示图像左上角在目标画布中的位置；
     /// 2. Width / Height 表示这张图最终要被绘制成多大；
-    /// 3. Feather* 表示四个边缘参与羽化混合的宽度。
+    /// 3. Feather* 表示四个边缘与相邻图的实际重叠范围，供拼缝权重计算使用。
     ///
     /// 之所以把“位置”和“羽化信息”放在同一个模型里，是因为 GPU 拼图着色器
     /// 在处理一张图时，需要同时知道它被放到哪里、以多大尺寸采样、以及哪些边缘
@@ -32,16 +32,16 @@ namespace GPUStitch.Models
         /// </summary>
         public float Height;
 
-        /// <summary>左边缘羽化宽度。</summary>
+        /// <summary>左边缘与相邻图的重叠范围。</summary>
         public float FeatherLeft;
 
-        /// <summary>右边缘羽化宽度。</summary>
+        /// <summary>右边缘与相邻图的重叠范围。</summary>
         public float FeatherRight;
 
-        /// <summary>上边缘羽化宽度。</summary>
+        /// <summary>上边缘与相邻图的重叠范围。</summary>
         public float FeatherTop;
 
-        /// <summary>下边缘羽化宽度。</summary>
+        /// <summary>下边缘与相邻图的重叠范围。</summary>
         public float FeatherBottom;
     }
 }

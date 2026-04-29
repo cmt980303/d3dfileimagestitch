@@ -899,10 +899,12 @@ namespace GPUStitch
         }
 
         /// <summary>
-        /// 给每张图写入羽化提示。
+        /// 给每张图写入边缘重叠范围。
         ///
-        /// 这里区分“有无邻居”而不是“是否一定存在重叠像素”，
-        /// 因为当前阶段的目标是先生成一个稳定、直观的默认混合策略。
+        /// 当前拼缝质量主要取决于“真实发生重叠的区域有多宽”，
+        /// 而不是简单地看某一侧是否存在邻居。因此这里会把每个方向
+        /// 与相邻图的实际重叠像素写回 placement，供 StitchCS 在缝中部
+        /// 附近构造有限宽度的过渡带。
         /// </summary>
         private void ApplyFeatherHints(List<ImagePlacement> placements, float blendWidth)
         {
@@ -914,25 +916,109 @@ namespace GPUStitch
             for (int i = 0; i < placements.Count; i++)
             {
                 var placement = placements[i];
+                placement.FeatherLeft = 0.0f;
+                placement.FeatherRight = 0.0f;
+                placement.FeatherTop = 0.0f;
+                placement.FeatherBottom = 0.0f;
 
                 if (hasGrid && _metadataCoordinates[i].HasValue)
                 {
                     var coordinate = _metadataCoordinates[i]!.Value;
-                    placement.FeatherLeft = _indexByCoordinate.ContainsKey(new GridImageCoordinate(coordinate.Row, coordinate.Column - 1)) ? blendWidth : 0.0f;
-                    placement.FeatherRight = _indexByCoordinate.ContainsKey(new GridImageCoordinate(coordinate.Row, coordinate.Column + 1)) ? blendWidth : 0.0f;
-                    placement.FeatherTop = _indexByCoordinate.ContainsKey(new GridImageCoordinate(coordinate.Row - 1, coordinate.Column)) ? blendWidth : 0.0f;
-                    placement.FeatherBottom = _indexByCoordinate.ContainsKey(new GridImageCoordinate(coordinate.Row + 1, coordinate.Column)) ? blendWidth : 0.0f;
+                    if (_indexByCoordinate.TryGetValue(
+                        new GridImageCoordinate(coordinate.Row, coordinate.Column - 1),
+                        out int leftIndex))
+                    {
+                        placement.FeatherLeft = ComputeHorizontalOverlap(
+                            placements[leftIndex],
+                            placement);
+                    }
+
+                    if (_indexByCoordinate.TryGetValue(
+                        new GridImageCoordinate(coordinate.Row, coordinate.Column + 1),
+                        out int rightIndex))
+                    {
+                        placement.FeatherRight = ComputeHorizontalOverlap(
+                            placement,
+                            placements[rightIndex]);
+                    }
+
+                    if (_indexByCoordinate.TryGetValue(
+                        new GridImageCoordinate(coordinate.Row - 1, coordinate.Column),
+                        out int topIndex))
+                    {
+                        placement.FeatherTop = ComputeVerticalOverlap(
+                            placements[topIndex],
+                            placement);
+                    }
+
+                    if (_indexByCoordinate.TryGetValue(
+                        new GridImageCoordinate(coordinate.Row + 1, coordinate.Column),
+                        out int bottomIndex))
+                    {
+                        placement.FeatherBottom = ComputeVerticalOverlap(
+                            placement,
+                            placements[bottomIndex]);
+                    }
                 }
                 else
                 {
-                    placement.FeatherLeft = i > 0 ? blendWidth : 0.0f;
-                    placement.FeatherRight = i < placements.Count - 1 ? blendWidth : 0.0f;
-                    placement.FeatherTop = 0.0f;
-                    placement.FeatherBottom = 0.0f;
+                    if (i > 0)
+                    {
+                        placement.FeatherLeft = ComputeHorizontalOverlap(
+                            placements[i - 1],
+                            placement);
+                    }
+
+                    if (i < placements.Count - 1)
+                    {
+                        placement.FeatherRight = ComputeHorizontalOverlap(
+                            placement,
+                            placements[i + 1]);
+                    }
                 }
 
                 placements[i] = placement;
             }
+        }
+
+        private static float ComputeHorizontalOverlap(
+            ImagePlacement leftPlacement,
+            ImagePlacement rightPlacement)
+        {
+            float overlapWidth = Math.Min(
+                leftPlacement.OffsetX + leftPlacement.Width,
+                rightPlacement.OffsetX + rightPlacement.Width) -
+                Math.Max(leftPlacement.OffsetX, rightPlacement.OffsetX);
+
+            if (overlapWidth <= 0.0f)
+                return 0.0f;
+
+            float overlapHeight = Math.Min(
+                leftPlacement.OffsetY + leftPlacement.Height,
+                rightPlacement.OffsetY + rightPlacement.Height) -
+                Math.Max(leftPlacement.OffsetY, rightPlacement.OffsetY);
+
+            return overlapHeight > 0.0f ? overlapWidth : 0.0f;
+        }
+
+        private static float ComputeVerticalOverlap(
+            ImagePlacement topPlacement,
+            ImagePlacement bottomPlacement)
+        {
+            float overlapHeight = Math.Min(
+                topPlacement.OffsetY + topPlacement.Height,
+                bottomPlacement.OffsetY + bottomPlacement.Height) -
+                Math.Max(topPlacement.OffsetY, bottomPlacement.OffsetY);
+
+            if (overlapHeight <= 0.0f)
+                return 0.0f;
+
+            float overlapWidth = Math.Min(
+                topPlacement.OffsetX + topPlacement.Width,
+                bottomPlacement.OffsetX + bottomPlacement.Width) -
+                Math.Max(topPlacement.OffsetX, bottomPlacement.OffsetX);
+
+            return overlapWidth > 0.0f ? overlapHeight : 0.0f;
         }
 
         /// <summary>

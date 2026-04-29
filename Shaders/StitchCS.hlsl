@@ -11,7 +11,7 @@
 cbuffer StitchImageParams : register(b0)
 {
     float4 ImageParam;  // x=offsetX, y=offsetY, z=displayWidth, w=displayHeight
-    float4 FeatherParam; // x=left, y=right, z=top, w=bottom
+    float4 FeatherParam; // x=leftOverlap, y=rightOverlap, z=topOverlap, w=bottomOverlap
     float2 OutputSize;  // canvas width / height
     float  BlendWidth;
     float  Padding0;
@@ -22,6 +22,26 @@ RWTexture2D<float4> AccumTex : register(u0); // rgb = weighted color sum, a = we
 
 SamplerState LinearSampler : register(s0);
 
+float ComputeEdgeWeight(float distanceFromEdge, float overlapSize)
+{
+    if (overlapSize <= 0.0)
+        return 1.0;
+
+    float transitionWidth = min(max(BlendWidth, 0.0), overlapSize);
+    if (transitionWidth <= 1e-4)
+        return distanceFromEdge >= overlapSize * 0.5 ? 1.0 : 0.0;
+
+    float seamCenter = overlapSize * 0.5;
+    float halfTransition = transitionWidth * 0.5;
+    float transitionStart = max(0.0, seamCenter - halfTransition);
+    float transitionEnd = min(overlapSize, seamCenter + halfTransition);
+
+    if (transitionEnd <= transitionStart + 1e-4)
+        return distanceFromEdge >= seamCenter ? 1.0 : 0.0;
+
+    return smoothstep(transitionStart, transitionEnd, distanceFromEdge);
+}
+
 float ComputeBlendWeight(float2 localPos, float2 imageSize)
 {
     if (BlendWidth <= 0.0)
@@ -30,16 +50,16 @@ float ComputeBlendWeight(float2 localPos, float2 imageSize)
     float weight = 1.0;
 
     if (FeatherParam.x > 0.0)
-        weight *= smoothstep(0.0, FeatherParam.x, localPos.x);
+        weight *= ComputeEdgeWeight(localPos.x, FeatherParam.x);
 
     if (FeatherParam.y > 0.0)
-        weight *= smoothstep(0.0, FeatherParam.y, imageSize.x - localPos.x);
+        weight *= ComputeEdgeWeight(imageSize.x - localPos.x, FeatherParam.y);
 
     if (FeatherParam.z > 0.0)
-        weight *= smoothstep(0.0, FeatherParam.z, localPos.y);
+        weight *= ComputeEdgeWeight(localPos.y, FeatherParam.z);
 
     if (FeatherParam.w > 0.0)
-        weight *= smoothstep(0.0, FeatherParam.w, imageSize.y - localPos.y);
+        weight *= ComputeEdgeWeight(imageSize.y - localPos.y, FeatherParam.w);
 
     return max(weight, 1e-4);
 }
@@ -64,8 +84,9 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID)
         (localPixel.x + 0.5) / max(ImageParam.z, 1.0),
         (localPixel.y + 0.5) / max(ImageParam.w, 1.0));
 
+    float2 localCenter = float2(localPixel) + 0.5;
     float4 color = SrcImage.SampleLevel(LinearSampler, uv, 0);
-    float weight = ComputeBlendWeight(float2(localPixel), ImageParam.zw);
+    float weight = ComputeBlendWeight(localCenter, ImageParam.zw);
 
     float4 accum = AccumTex[dstPixel];
     accum.rgb += color.rgb * weight;

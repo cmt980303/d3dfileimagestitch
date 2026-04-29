@@ -34,7 +34,7 @@
 cbuffer StitchImageParams : register(b0)
 {
     float4 ImageParam;  // x=offsetX, y=offsetY, z=displayWidth, w=displayHeight
-    float4 FeatherParam; // x=left, y=right, z=top, w=bottom
+    float4 FeatherParam; // x=leftOverlap, y=rightOverlap, z=topOverlap, w=bottomOverlap
     float2 OutputSize;  // canvas width / height
     float  BlendWidth;
     float  Padding0;
@@ -45,6 +45,26 @@ RWTexture2D<float4> AccumTex : register(u0); // rgb = weighted color sum, a = we
 
 SamplerState LinearSampler : register(s0);
 
+float ComputeEdgeWeight(float distanceFromEdge, float overlapSize)
+{
+    if (overlapSize <= 0.0)
+        return 1.0;
+
+    float transitionWidth = min(max(BlendWidth, 0.0), overlapSize);
+    if (transitionWidth <= 1e-4)
+        return distanceFromEdge >= overlapSize * 0.5 ? 1.0 : 0.0;
+
+    float seamCenter = overlapSize * 0.5;
+    float halfTransition = transitionWidth * 0.5;
+    float transitionStart = max(0.0, seamCenter - halfTransition);
+    float transitionEnd = min(overlapSize, seamCenter + halfTransition);
+
+    if (transitionEnd <= transitionStart + 1e-4)
+        return distanceFromEdge >= seamCenter ? 1.0 : 0.0;
+
+    return smoothstep(transitionStart, transitionEnd, distanceFromEdge);
+}
+
 float ComputeBlendWeight(float2 localPos, float2 imageSize)
 {
     if (BlendWidth <= 0.0)
@@ -53,16 +73,16 @@ float ComputeBlendWeight(float2 localPos, float2 imageSize)
     float weight = 1.0;
 
     if (FeatherParam.x > 0.0)
-        weight *= smoothstep(0.0, FeatherParam.x, localPos.x);
+        weight *= ComputeEdgeWeight(localPos.x, FeatherParam.x);
 
     if (FeatherParam.y > 0.0)
-        weight *= smoothstep(0.0, FeatherParam.y, imageSize.x - localPos.x);
+        weight *= ComputeEdgeWeight(imageSize.x - localPos.x, FeatherParam.y);
 
     if (FeatherParam.z > 0.0)
-        weight *= smoothstep(0.0, FeatherParam.z, localPos.y);
+        weight *= ComputeEdgeWeight(localPos.y, FeatherParam.z);
 
     if (FeatherParam.w > 0.0)
-        weight *= smoothstep(0.0, FeatherParam.w, imageSize.y - localPos.y);
+        weight *= ComputeEdgeWeight(imageSize.y - localPos.y, FeatherParam.w);
 
     return max(weight, 1e-4);
 }
@@ -87,8 +107,9 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID)
         (localPixel.x + 0.5) / max(ImageParam.z, 1.0),
         (localPixel.y + 0.5) / max(ImageParam.w, 1.0));
 
+    float2 localCenter = float2(localPixel) + 0.5;
     float4 color = SrcImage.SampleLevel(LinearSampler, uv, 0);
-    float weight = ComputeBlendWeight(float2(localPixel), ImageParam.zw);
+    float weight = ComputeBlendWeight(localCenter, ImageParam.zw);
 
     float4 accum = AccumTex[dstPixel];
     accum.rgb += color.rgb * weight;
@@ -105,11 +126,12 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID)
 
 - `ImageParam.xy`：当前图左上角在目标画布中的偏移
 - `ImageParam.zw`：当前图在目标画布中的显示尺寸
-- `FeatherParam`：四个方向的羽化宽度
+- `FeatherParam`：四个方向与相邻图的实际重叠范围
 - `OutputSize`：整张输出画布大小
-- `BlendWidth`：是否启用混合的总开关
+- `BlendWidth`：缝中部过渡带的目标宽度
 
-虽然 `BlendWidth` 在 `ComputeBlendWeight` 里只作为开/关判断使用，但保留它能让 CPU 侧逻辑更统一：滑块为 0 时可以直接关闭羽化。
+CPU 侧会先计算每个边缘与邻图的真实重叠范围，再把它写进 `FeatherParam`。  
+`BlendWidth` 不再表示“整条边都要羽化多宽”，而是表示“真正做过渡的带子多宽”；如果它大于实际重叠范围，着色器会自动把过渡压缩回整个重叠区。
 
 ### 2. `AccumTex`
 
@@ -140,11 +162,19 @@ finalColor = sumColor / sumWeight
 
 当前版本有两个关键点：
 
-1. **使用 `smoothstep` 而不是线性 `saturate`**
-2. **四个方向权重用乘法组合，而不是取 `min`**
+1. **先根据真实重叠范围求出缝中心，再只在中心附近做过渡**
+2. **四个方向权重仍然用乘法组合，而不是取 `min`**
 
-原因是之前线性斜坡 + `min` 组合时，边缘一阶导数不连续，在缩小显示时更容易出现暗纹和摩尔纹。  
-`smoothstep` 会让边缘过渡更平滑，乘法组合也更适合表达“同时受到多个边的衰减”。
+这样做是为了避免旧版本里最明显的问题：  
+如果两张图真实重叠 120 像素，而羽化宽度只设成 40 像素，那么重叠中间会出现一大段“左右两张图权重都等于 1”的区域，归一化后就变成整段平均，轻微错位时会直接形成模糊带。
+
+新版本会先用 `FeatherParam` 表示真实重叠范围，再把 `BlendWidth` 当作缝中部的过渡带宽度：  
+
+- 重叠区靠本图一侧：权重保持接近 1
+- 重叠区靠邻图一侧：权重降到接近 0
+- 只有靠近缝中心的窄带才做 `smoothstep` 过渡
+
+这样既保留了羽化拼缝的柔和感，也避免整段重叠区长期处于双图平均状态。
 
 最后的 `max(weight, 1e-4)` 也很重要：
 
