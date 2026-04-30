@@ -137,7 +137,7 @@ namespace GPUStitch.Core
                 forwardOrientation,
                 SearchRegion.Full);
 
-            (int relativeOffsetX, int relativeOffsetY) = ComputeRelativeOffset(
+            (float relativeOffsetX, float relativeOffsetY) = ComputeRelativeOffset(
                 best.BestDeltaX,
                 best.BestDeltaY,
                 first,
@@ -178,8 +178,8 @@ namespace GPUStitch.Core
 
             Debug.WriteLine(
                 $"[Registration] 配准 [{sourceIndex}]->[{targetIndex}] {axis}: " +
-                $"score={best.Score:F4}, delta=({best.BestDeltaX},{best.BestDeltaY}), " +
-                $"offset=({relativeOffsetX},{relativeOffsetY}), overlap={overlapSize}, " +
+                $"score={best.Score:F4}, delta=({best.BestDeltaX:F3},{best.BestDeltaY:F3}), " +
+                $"offset=({relativeOffsetX:F3},{relativeOffsetY:F3}), overlap={overlapSize}, " +
                 $"peakMargin={diagnostics.PeakMargin:F4}, roundTrip={diagnostics.RoundTripErrorMagnitude:F2}px, " +
                 $"localDrift={diagnostics.SegmentSpreadMagnitude:F2}px, " +
                 $"confident={isConfident}{(isConfident ? "" : " [FALLBACK]")}");
@@ -245,9 +245,9 @@ namespace GPUStitch.Core
             }
         }
 
-        private static (int OffsetX, int OffsetY) ComputeRelativeOffset(
-            int bestDeltaX,
-            int bestDeltaY,
+        private static (float OffsetX, float OffsetY) ComputeRelativeOffset(
+            float bestDeltaX,
+            float bestDeltaY,
             GpuImage first,
             GpuImage second,
             int overlapSize,
@@ -257,30 +257,30 @@ namespace GPUStitch.Core
             {
                 case SearchOrientation.HorizontalForward:
                 {
-                    int baseShiftX = Math.Max(1, first.Width - overlapSize);
+                    float baseShiftX = Math.Max(1, first.Width - overlapSize);
                     return (baseShiftX - bestDeltaX, -bestDeltaY);
                 }
                 case SearchOrientation.VerticalForward:
                 {
-                    int baseShiftY = Math.Max(1, first.Height - overlapSize);
+                    float baseShiftY = Math.Max(1, first.Height - overlapSize);
                     return (-bestDeltaX, baseShiftY - bestDeltaY);
                 }
                 case SearchOrientation.HorizontalReverse:
                 {
-                    int baseShiftX = Math.Max(1, second.Width - overlapSize);
-                    return (-(baseShiftX + bestDeltaX), bestDeltaY);
+                    float baseShiftX = Math.Max(1, second.Width - overlapSize);
+                    return (-(baseShiftX + bestDeltaX), -bestDeltaY);
                 }
                 case SearchOrientation.VerticalReverse:
                 {
-                    int baseShiftY = Math.Max(1, second.Height - overlapSize);
-                    return (bestDeltaX, -(baseShiftY + bestDeltaY));
+                    float baseShiftY = Math.Max(1, second.Height - overlapSize);
+                    return (-bestDeltaX, -(baseShiftY + bestDeltaY));
                 }
                 default:
                     throw new InvalidOperationException($"未知搜索方向: {orientation}");
             }
         }
 
-        private static (int OffsetX, int OffsetY) CreateFallbackOffset(
+        private static (float OffsetX, float OffsetY) CreateFallbackOffset(
             GpuImage first,
             int overlapSize,
             RegistrationAxis axis)
@@ -298,8 +298,8 @@ namespace GPUStitch.Core
             RegistrationOptions options,
             RegistrationAxis axis,
             BestScoreResult best,
-            int forwardOffsetX,
-            int forwardOffsetY)
+            float forwardOffsetX,
+            float forwardOffsetY)
         {
             SearchOrientation reverseOrientation = axis == RegistrationAxis.Horizontal
                 ? SearchOrientation.HorizontalReverse
@@ -313,7 +313,7 @@ namespace GPUStitch.Core
                 reverseOrientation,
                 SearchRegion.Full);
 
-            (int reverseOffsetX, int reverseOffsetY) = ComputeRelativeOffset(
+            (float reverseOffsetX, float reverseOffsetY) = ComputeRelativeOffset(
                 reverse.BestDeltaX,
                 reverse.BestDeltaY,
                 second,
@@ -325,10 +325,10 @@ namespace GPUStitch.Core
             float roundTripErrorY = forwardOffsetY + reverseOffsetY;
 
             int validSegments = 0;
-            int minSegmentOffsetX = 0;
-            int maxSegmentOffsetX = 0;
-            int minSegmentOffsetY = 0;
-            int maxSegmentOffsetY = 0;
+            float minSegmentOffsetX = 0;
+            float maxSegmentOffsetX = 0;
+            float minSegmentOffsetY = 0;
+            float maxSegmentOffsetY = 0;
 
             var segmentRegions = BuildSegmentRegions(first, second, axis);
             for (int i = 0; i < segmentRegions.Length; i++)
@@ -349,7 +349,7 @@ namespace GPUStitch.Core
                 if (segment.Score < options.ConfidenceThreshold)
                     continue;
 
-                (int segmentOffsetX, int segmentOffsetY) = ComputeRelativeOffset(
+                (float segmentOffsetX, float segmentOffsetY) = ComputeRelativeOffset(
                     segment.BestDeltaX,
                     segment.BestDeltaY,
                     first,
@@ -983,6 +983,7 @@ namespace GPUStitch.Core
             int bestY = 0;
             float bestScore = float.NegativeInfinity;
             float secondBestScore = float.NegativeInfinity;
+            var scores = new float[width * height];
 
             // ScoreTexture 是二维搜索图：
             // x 轴对应 deltaX 候选，y 轴对应 deltaY 候选。
@@ -998,6 +999,7 @@ namespace GPUStitch.Core
                         for (int x = 0; x < width; x++)
                         {
                             float score = row[x];
+                            scores[(y * width) + x] = score;
                             if (score > bestScore)
                             {
                                 secondBestScore = bestScore;
@@ -1018,11 +1020,59 @@ namespace GPUStitch.Core
                 _deviceManager.Context.Unmap(_scoreReadbackTexture!, 0);
             }
 
+            float refinedX = bestX + ComputeParabolicSubpixelOffset(scores, width, height, bestX, bestY, isXAxis: true);
+            float refinedY = bestY + ComputeParabolicSubpixelOffset(scores, width, height, bestX, bestY, isXAxis: false);
+
             return new BestScoreResult(
-                bestX - ((width - 1) / 2),
-                bestY - ((height - 1) / 2),
+                refinedX - ((width - 1) / 2.0f),
+                refinedY - ((height - 1) / 2.0f),
                 bestScore,
                 secondBestScore);
+        }
+
+        private static float ComputeParabolicSubpixelOffset(
+            float[] scores,
+            int width,
+            int height,
+            int bestX,
+            int bestY,
+            bool isXAxis)
+        {
+            if (isXAxis)
+            {
+                if (bestX <= 0 || bestX >= width - 1)
+                    return 0.0f;
+
+                float left = scores[(bestY * width) + bestX - 1];
+                float center = scores[(bestY * width) + bestX];
+                float right = scores[(bestY * width) + bestX + 1];
+                return ComputeParabolicOffset(left, center, right);
+            }
+
+            if (bestY <= 0 || bestY >= height - 1)
+                return 0.0f;
+
+            float top = scores[((bestY - 1) * width) + bestX];
+            float centerY = scores[(bestY * width) + bestX];
+            float bottom = scores[((bestY + 1) * width) + bestX];
+            return ComputeParabolicOffset(top, centerY, bottom);
+        }
+
+        private static float ComputeParabolicOffset(float negative, float center, float positive)
+        {
+            float denominator = negative - (2.0f * center) + positive;
+            if (Math.Abs(denominator) < 1e-6f)
+                return 0.0f;
+
+            float offset = 0.5f * (negative - positive) / denominator;
+            if (float.IsNaN(offset) || float.IsInfinity(offset))
+                return 0.0f;
+
+            if (offset < -0.5f)
+                return -0.5f;
+            if (offset > 0.5f)
+                return 0.5f;
+            return offset;
         }
 
         private static int Clamp(int value, int min, int max)
@@ -1058,7 +1108,7 @@ namespace GPUStitch.Core
         /// </summary>
         private readonly struct BestScoreResult
         {
-            public BestScoreResult(int bestDeltaX, int bestDeltaY, float score, float secondBestScore)
+            public BestScoreResult(float bestDeltaX, float bestDeltaY, float score, float secondBestScore)
             {
                 BestDeltaX = bestDeltaX;
                 BestDeltaY = bestDeltaY;
@@ -1066,8 +1116,8 @@ namespace GPUStitch.Core
                 SecondBestScore = secondBestScore;
             }
 
-            public int BestDeltaX { get; }
-            public int BestDeltaY { get; }
+            public float BestDeltaX { get; }
+            public float BestDeltaY { get; }
             public float Score { get; }
             public float SecondBestScore { get; }
         }

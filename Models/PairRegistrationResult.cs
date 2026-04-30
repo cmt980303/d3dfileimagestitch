@@ -27,12 +27,12 @@ namespace GPUStitch.Models
             int sourceIndex,
             int targetIndex,
             RegistrationAxis axis,
-            int bestDeltaX,
-            int bestDeltaY,
+            float bestDeltaX,
+            float bestDeltaY,
             float score,
             int overlapSize,
-            int relativeOffsetX,
-            int relativeOffsetY,
+            float relativeOffsetX,
+            float relativeOffsetY,
             bool isConfident,
             PairRegistrationDiagnostics diagnostics)
         {
@@ -62,12 +62,12 @@ namespace GPUStitch.Models
         /// 搜索窗口内得到的最佳 X 偏移修正量。
         /// 它是相对“预估重叠位置”的局部修正，而不是最终世界坐标。
         /// </summary>
-        public int BestDeltaX { get; }
+        public float BestDeltaX { get; }
 
         /// <summary>
         /// 搜索窗口内得到的最佳 Y 偏移修正量。
         /// </summary>
-        public int BestDeltaY { get; }
+        public float BestDeltaY { get; }
 
         /// <summary>
         /// 配准评分。当前使用“零均值亮度相关 + 梯度相关”的混合分数。
@@ -85,12 +85,12 @@ namespace GPUStitch.Models
         /// 从源图到目标图的最终 X 位移。
         /// 这是布局阶段真正会使用的偏移量。
         /// </summary>
-        public int RelativeOffsetX { get; }
+        public float RelativeOffsetX { get; }
 
         /// <summary>
         /// 从源图到目标图的最终 Y 位移。
         /// </summary>
-        public int RelativeOffsetY { get; }
+        public float RelativeOffsetY { get; }
 
         /// <summary>
         /// 当前结果是否达到置信阈值。

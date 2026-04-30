@@ -277,9 +277,14 @@ namespace GPUStitch.Core
         /// </summary>
         private void AccumulateSingleImage(GpuImage image, ImagePlacement placement)
         {
-            // Dispatch 网格大小由这张图在目标画布中的显示尺寸决定。
-            int imageWidth = Math.Max(1, (int)Math.Ceiling(placement.Width));
-            int imageHeight = Math.Max(1, (int)Math.Ceiling(placement.Height));
+            // 这里按 placement 的包围盒而不是简单的 width/height dispatch，
+            // 这样在 offset 带有小数时，边缘额外覆盖到的那 1 个像素也能被正确处理。
+            int imageWidth = Math.Max(
+                1,
+                (int)Math.Ceiling(placement.OffsetX + placement.Width) - (int)Math.Floor(placement.OffsetX));
+            int imageHeight = Math.Max(
+                1,
+                (int)Math.Ceiling(placement.OffsetY + placement.Height) - (int)Math.Floor(placement.OffsetY));
 
             UpdateImageConstants(placement);
 

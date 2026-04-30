@@ -91,8 +91,9 @@ for (int y = yStart; y < yEnd; y += max(SampleStep, 1))
 // RegistrationCS.hlsl - hybrid GPU registration
 // ============================================================
 // This shader evaluates one candidate offset per thread and writes
-// the score into ScoreMap. It supports both horizontal neighbors
-// (left -> right) and vertical neighbors (top -> bottom).
+// the score into ScoreMap. It supports both forward and reverse
+// searches for horizontal / vertical neighbors, and can optionally
+// restrict sampling to a cross-axis sub-range for diagnostics.
 // ============================================================
 
 cbuffer RegistrationParams : register(b0)
@@ -107,8 +108,10 @@ cbuffer RegistrationParams : register(b0)
     int   SearchRangeY;
     int   SampleStep;
 
-    int   Orientation;       // 0 = horizontal, 1 = vertical
+    int   Orientation;       // 0 = H forward, 1 = V forward, 2 = H reverse, 3 = V reverse
     int   MinSampleCount;
+    int   RegionStart;
+    int   RegionEnd;
     float MinGradientEnergy;
     float MinLumaVariance;
 
@@ -333,13 +336,15 @@ return dot(color.rgb, float3(0.299, 0.587, 0.114));
 
 这一步决定“在当前候选位移下，第一张图中哪些像素会落到有效重叠区域里”。
 
-它分两种情况：
+当前版本在诊断模式下会分四种情况：
 
-- `Orientation == 0`：左右相邻图
-- `Orientation == 1`：上下相邻图
+- `Orientation == 0`：左右相邻图，正向（左 -> 右）
+- `Orientation == 1`：上下相邻图，正向（上 -> 下）
+- `Orientation == 2`：左右相邻图，反向（右 -> 左）
+- `Orientation == 3`：上下相邻图，反向（下 -> 上）
 
-水平配准时，第一张图参与比较的是它的**右侧重叠带**；  
-垂直配准时，参与比较的是它的**下侧重叠带**。
+同时 `RegionStart / RegionEnd` 允许 CPU 把采样限制到交叉轴上的某个局部分段。  
+这正是当前项目里“局部漂移诊断”的基础：把重叠区切成几段分别搜索，再看各段 offset 是否一致。
 
 同时这里还会结合 `deltaX / deltaY` 调整有效采样边界，避免后续访问越界。
 
@@ -351,6 +356,7 @@ return dot(color.rgb, float3(0.299, 0.587, 0.114));
 
 - 水平配准：第二张图大体在第一张图右边
 - 垂直配准：第二张图大体在第一张图下边
+- 反向诊断时：同一条边会再按相反方向搜索一次，用于计算 round-trip 自洽误差
 
 GPU 搜索并不是在全空间暴力乱找，而是在这个先验关系附近做局部修正。
 

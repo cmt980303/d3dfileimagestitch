@@ -267,7 +267,7 @@ namespace GPUStitch
 
                 // 注意：这里得到的是“真实配准布局”；
                 // 但为了能稳定显示在 WPF 中，还需要经过一次预览预算缩放和整数像素对齐。
-                var preview = PreparePreviewLayout(layout, blendWidth);
+                var preview = PreparePreviewLayout(layout, blendWidth, preserveSubpixelPlacement: true);
                 ApplyFeatherHints(preview.Placements, preview.BlendWidth);
 
                 _stitcher!.BlendWidth = preview.BlendWidth;
@@ -1270,7 +1270,8 @@ namespace GPUStitch
         /// </summary>
         private static PreviewLayout PreparePreviewLayout(
             RegistrationLayout layout,
-            float blendWidth)
+            float blendWidth,
+            bool preserveSubpixelPlacement = false)
         {
             float dimensionScale = Math.Min(
                 1.0f,
@@ -1319,21 +1320,27 @@ namespace GPUStitch
                 scaledBlend = Math.Max(1.0f, blendWidth * scale);
             }
 
-            // 将偏移和尺寸四舍五入到整数像素，消除亚像素间隙导致的条纹。
-            // 这是当前版本里非常关键的稳定性处理：如果 placement 落在半像素位置，
-            // WPF 再次缩放显示时就更容易看到暗纹和摩尔纹。
             int canvasWidth = 0, canvasHeight = 0;
             for (int i = 0; i < placements.Count; i++)
             {
                 var p = placements[i];
-                p.OffsetX = (float)Math.Round(p.OffsetX);
-                p.OffsetY = (float)Math.Round(p.OffsetY);
-                p.Width = Math.Max(1.0f, (float)Math.Round(p.Width));
-                p.Height = Math.Max(1.0f, (float)Math.Round(p.Height));
+                if (!preserveSubpixelPlacement)
+                {
+                    // 渐进式预览仍保持整数像素对齐，优先保证 WPF 预览稳定性。
+                    p.OffsetX = (float)Math.Round(p.OffsetX);
+                    p.OffsetY = (float)Math.Round(p.OffsetY);
+                    p.Width = Math.Max(1.0f, (float)Math.Round(p.Width));
+                    p.Height = Math.Max(1.0f, (float)Math.Round(p.Height));
+                }
+                else
+                {
+                    p.Width = Math.Max(1.0f, p.Width);
+                    p.Height = Math.Max(1.0f, p.Height);
+                }
                 placements[i] = p;
 
-                canvasWidth = Math.Max(canvasWidth, (int)(p.OffsetX + p.Width));
-                canvasHeight = Math.Max(canvasHeight, (int)(p.OffsetY + p.Height));
+                canvasWidth = Math.Max(canvasWidth, (int)Math.Ceiling(p.OffsetX + p.Width));
+                canvasHeight = Math.Max(canvasHeight, (int)Math.Ceiling(p.OffsetY + p.Height));
             }
 
             canvasWidth = Math.Max(1, canvasWidth);

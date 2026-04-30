@@ -68,23 +68,29 @@ float ComputeBlendWeight(float2 localPos, float2 imageSize)
 void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID)
 {
     int2 localPixel = int2(dispatchThreadId.xy);
-    int2 imageSize = int2(ceil(ImageParam.z), ceil(ImageParam.w));
+    float2 bboxOrigin = floor(ImageParam.xy);
+    int2 bboxSize = int2(ceil(ImageParam.xy + ImageParam.zw) - bboxOrigin);
 
-    if (localPixel.x >= imageSize.x || localPixel.y >= imageSize.y)
+    if (localPixel.x >= bboxSize.x || localPixel.y >= bboxSize.y)
         return;
 
-    int2 dstPixel = int2(round(ImageParam.xy)) + localPixel;
+    int2 dstPixel = int2(bboxOrigin) + localPixel;
     if (dstPixel.x < 0 || dstPixel.y < 0 ||
         dstPixel.x >= (int)OutputSize.x || dstPixel.y >= (int)OutputSize.y)
     {
         return;
     }
 
-    float2 uv = float2(
-        (localPixel.x + 0.5) / max(ImageParam.z, 1.0),
-        (localPixel.y + 0.5) / max(ImageParam.w, 1.0));
+    float2 localCenter = (float2(dstPixel) + 0.5) - ImageParam.xy;
+    if (localCenter.x < 0.0 || localCenter.y < 0.0 ||
+        localCenter.x >= ImageParam.z || localCenter.y >= ImageParam.w)
+    {
+        return;
+    }
 
-    float2 localCenter = float2(localPixel) + 0.5;
+    float2 uv = float2(
+        localCenter.x / max(ImageParam.z, 1.0),
+        localCenter.y / max(ImageParam.w, 1.0));
     float4 color = SrcImage.SampleLevel(LinearSampler, uv, 0);
     float weight = ComputeBlendWeight(localCenter, ImageParam.zw);
 

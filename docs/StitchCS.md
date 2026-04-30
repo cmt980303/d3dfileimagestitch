@@ -91,23 +91,29 @@ float ComputeBlendWeight(float2 localPos, float2 imageSize)
 void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID)
 {
     int2 localPixel = int2(dispatchThreadId.xy);
-    int2 imageSize = int2(ceil(ImageParam.z), ceil(ImageParam.w));
+    float2 bboxOrigin = floor(ImageParam.xy);
+    int2 bboxSize = int2(ceil(ImageParam.xy + ImageParam.zw) - bboxOrigin);
 
-    if (localPixel.x >= imageSize.x || localPixel.y >= imageSize.y)
+    if (localPixel.x >= bboxSize.x || localPixel.y >= bboxSize.y)
         return;
 
-    int2 dstPixel = int2(round(ImageParam.xy)) + localPixel;
+    int2 dstPixel = int2(bboxOrigin) + localPixel;
     if (dstPixel.x < 0 || dstPixel.y < 0 ||
         dstPixel.x >= (int)OutputSize.x || dstPixel.y >= (int)OutputSize.y)
     {
         return;
     }
 
-    float2 uv = float2(
-        (localPixel.x + 0.5) / max(ImageParam.z, 1.0),
-        (localPixel.y + 0.5) / max(ImageParam.w, 1.0));
+    float2 localCenter = (float2(dstPixel) + 0.5) - ImageParam.xy;
+    if (localCenter.x < 0.0 || localCenter.y < 0.0 ||
+        localCenter.x >= ImageParam.z || localCenter.y >= ImageParam.w)
+    {
+        return;
+    }
 
-    float2 localCenter = float2(localPixel) + 0.5;
+    float2 uv = float2(
+        localCenter.x / max(ImageParam.z, 1.0),
+        localCenter.y / max(ImageParam.w, 1.0));
     float4 color = SrcImage.SampleLevel(LinearSampler, uv, 0);
     float weight = ComputeBlendWeight(localCenter, ImageParam.zw);
 
@@ -182,27 +188,34 @@ finalColor = sumColor / sumWeight
 - 避免后续归一化阶段某些位置 `sumWeight` 过小甚至为 0
 - 在渐进式导入时，即便邻居还没加载，单张图边缘也不至于被完全抹空
 
-### 4. `round(ImageParam.xy)`
+### 4. 浮点 placement 的包围盒 dispatch
 
-这是当前版本里修复缩小时条纹问题的关键之一。
-
-如果目标偏移是小数，例如 `100.4`，那实际纹理采样和 WPF 的再次缩放会共同制造亚像素缝隙。  
-这些缝隙在放大时不明显，但在缩小时很容易形成暗纹。
-
-因此这里明确把 placement 偏移对齐到整数像素：
+当前版本为了支持亚像素配准结果，不再直接把 `ImageParam.xy` 四舍五入后落图。  
+而是先求出这张图在目标画布上的包围盒：
 
 ```hlsl
-int2 dstPixel = int2(round(ImageParam.xy)) + localPixel;
+float2 bboxOrigin = floor(ImageParam.xy);
+int2 bboxSize = int2(ceil(ImageParam.xy + ImageParam.zw) - bboxOrigin);
 ```
 
-对应地，C# 侧也会在预览布局阶段把偏移和尺寸做整数化，两边共同保证几何对齐。
+这样只要 `OffsetX / OffsetY` 带有小数，shader 仍然会覆盖到它真正影响到的目标像素范围。
 
-### 5. `uv` 的计算
+### 5. `localCenter`
+
+```hlsl
+float2 localCenter = (float2(dstPixel) + 0.5) - ImageParam.xy;
+```
+
+这里不是再用 `localPixel + 0.5`，而是把“目标像素中心”反推回当前图内部的浮点位置。  
+这正是把亚像素位移真正保留下来的关键：  
+配准器算出来的小数偏移，会直接体现在源图采样坐标里，而不是在渲染阶段被吃掉。
+
+### 6. `uv` 的计算
 
 ```hlsl
 float2 uv = float2(
-    (localPixel.x + 0.5) / max(ImageParam.z, 1.0),
-    (localPixel.y + 0.5) / max(ImageParam.w, 1.0));
+    localCenter.x / max(ImageParam.z, 1.0),
+    localCenter.y / max(ImageParam.w, 1.0));
 ```
 
 这里使用像素中心 `(x + 0.5)` 采样，而不是像素左上角。  
@@ -210,7 +223,7 @@ float2 uv = float2(
 
 `max(..., 1.0)` 则是为了防止极端情况下宽高接近 0 时发生除零。
 
-### 6. 主流程
+### 7. 主流程
 
 主函数的实际顺序可以概括成：
 
