@@ -28,9 +28,14 @@ namespace GPUStitch.Core
         public int RegionStart;
         public int RegionEnd;
 
+        public int SearchCenterX;
+        public int SearchCenterY;
         public float MinGradientEnergy;
         public float MinLumaVariance;
+
         public float GradientWeight;
         public float LumaWeight;
+        public float Padding0;
+        public float Padding1;
     }
 }

@@ -32,7 +32,9 @@
 cbuffer RegistrationParams (常量缓冲区): 这里存放了配准任务的所有全局配置。CPU 会在运行 Shader 前把这些值填好。
 尺寸与范围: FirstWidth/Height 等定义了图像大小；
 
-SearchRangeX/Y 定义了探索偏移量的最大范围；
+SearchRangeX/Y 定义了当前这一轮搜索窗口的半径；
+
+SearchCenterX/Y 定义了当前搜索窗口围绕的中心偏移；
 
 OverlapSize 定义了理论上的重叠区域大小。
 
@@ -43,6 +45,9 @@ SampleStep 允许跳跃采样以提升性能（例如只采样一半的像素）
 阈值与权重:MinGradientEnergy、MinLumaVariance 用于过滤掉没有纹理的平坦区域（比如纯蓝天），避免算出无意义的得分；
 
 GradientWeight 和 LumaWeight 则决定了最终得分中梯度和亮度的占比。
+
+当前版本里，亮度相关也不会再让“大面积低纹理平坦背景”无差别地主导结果。  
+shader 会优先保留有一定梯度能量的采样点，再对这些更有信息量的样本做亮度统计。
 
 Texture2D & RWTexture2D (纹理绑定):FirstImage 和 SecondImage 是只读的输入图片。
 
@@ -74,7 +79,7 @@ ComputeSecondPixel:坐标转换核心。
 
 4. GPU 线程主入口 (CSMain)这是 Compute Shader 的心脏，每个 GPU 线程（对应一种 deltaX, deltaY 偏移组合）都会独立执行这个函数。
 线程 ID 映射与越界剔除:High-level shader languageint candidateX = (int)dispatchThreadId.x;
-int deltaX = candidateX - SearchRangeX;
+int deltaX = SearchCenterX + candidateX - SearchRangeX;
 GPU 线程是按网格分布的。代码首先将当前线程的 ID 转换为实际的偏移量 deltaX 和 deltaY。如果线程 ID 超出了设定的搜索范围，直接 return 结束运算。
 核心采样循环 (The Core Loop):High-level shader language[loop]
 for (int y = yStart; y < yEnd; y += max(SampleStep, 1))
@@ -112,6 +117,8 @@ cbuffer RegistrationParams : register(b0)
     int   MinSampleCount;
     int   RegionStart;
     int   RegionEnd;
+    int   SearchCenterX;
+    int   SearchCenterY;
     float MinGradientEnergy;
     float MinLumaVariance;
 
@@ -202,8 +209,8 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID)
     if (candidateX >= candidateCountX || candidateY >= candidateCountY)
         return;
 
-    int deltaX = candidateX - SearchRangeX;
-    int deltaY = candidateY - SearchRangeY;
+    int deltaX = SearchCenterX + candidateX - SearchRangeX;
+    int deltaY = SearchCenterY + candidateY - SearchRangeY;
 
     int xStart;
     int xEnd;
@@ -439,10 +446,14 @@ score = (gradientScore * GradientWeight + lumaScore * LumaWeight) / totalWeight;
 这个着色器由 `GpuRegistration.RegisterPair` 驱动：
 
 1. C# 侧决定当前是水平配准还是垂直配准
-2. C# 侧设定搜索半径、重叠宽度、采样步长和权重
-3. 着色器生成整张 `ScoreMap`
+2. C# 侧先做一轮大窗口粗搜索，再以粗搜索结果为中心做小窗口精搜索
+3. 着色器为当前这一轮搜索生成整张 `ScoreMap`
 4. C# 侧回读 `ScoreMap`
-5. C# 侧选最大值并换算成真实相对位移
+5. C# 侧选最大值并做亚像素细化
+6. C# 侧再换算成真实相对位移
+
+另外，正反向一致性和局部分段漂移这两类诊断，不再重复跑完整的大窗口 coarse-to-fine 搜索，  
+而是围绕主配准结果做小窗验证。这样一方面大幅降低诊断耗时，另一方面 `drift` 更接近“局部是否支持主解”，而不是“局部块是否在整个大窗口里各自找到不同平峰”。
 
 也就是说：
 

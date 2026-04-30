@@ -23,11 +23,16 @@ cbuffer RegistrationParams : register(b0)
     int   MinSampleCount;
     int   RegionStart;
     int   RegionEnd;
+
+    int   SearchCenterX;
+    int   SearchCenterY;
     float MinGradientEnergy;
     float MinLumaVariance;
 
     float GradientWeight;
     float LumaWeight;
+    float Padding0;
+    float Padding1;
 };
 
 Texture2D<float4> FirstImage  : register(t0);
@@ -148,8 +153,8 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID)
     if (candidateX >= candidateCountX || candidateY >= candidateCountY)
         return;
 
-    int deltaX = candidateX - SearchRangeX;
-    int deltaY = candidateY - SearchRangeY;
+    int deltaX = SearchCenterX + candidateX - SearchRangeX;
+    int deltaY = SearchCenterY + candidateY - SearchRangeY;
 
     int xStart;
     int xEnd;
@@ -182,26 +187,30 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID)
             if (!ComputeSecondPixel(x, y, deltaX, deltaY, secondPixel))
                 continue;
 
-            // Shift the luma distribution closer to zero before the Welford update.
-            // This keeps intermediate values smaller and further reduces precision loss.
-            float firstLuma = SampleLuma(FirstImage, int2(x, y)) - 0.5f;
-            float secondLuma = SampleLuma(SecondImage, secondPixel) - 0.5f;
-
-            lumaSampleCount++;
-            float sampleCountF = (float)lumaSampleCount;
-            float firstDelta = firstLuma - meanFirstLuma;
-            meanFirstLuma += firstDelta / sampleCountF;
-            float secondDelta = secondLuma - meanSecondLuma;
-            meanSecondLuma += secondDelta / sampleCountF;
-            firstLumaM2 += firstDelta * (firstLuma - meanFirstLuma);
-            secondLumaM2 += secondDelta * (secondLuma - meanSecondLuma);
-            lumaCovariance += firstDelta * (secondLuma - meanSecondLuma);
-
             float2 firstGradient = ComputeGradient(FirstImage, int2(x, y));
             float2 secondGradient = ComputeGradient(SecondImage, secondPixel);
 
             float firstEnergy = dot(firstGradient, firstGradient);
             float secondEnergy = dot(secondGradient, secondGradient);
+            float lumaTextureFloor = MinGradientEnergy * 0.25f;
+
+            if (firstEnergy >= lumaTextureFloor || secondEnergy >= lumaTextureFloor)
+            {
+                // Shift the luma distribution closer to zero before the Welford update.
+                // This keeps intermediate values smaller and reduces flat-background dominance.
+                float firstLuma = SampleLuma(FirstImage, int2(x, y)) - 0.5f;
+                float secondLuma = SampleLuma(SecondImage, secondPixel) - 0.5f;
+
+                lumaSampleCount++;
+                float sampleCountF = (float)lumaSampleCount;
+                float firstDelta = firstLuma - meanFirstLuma;
+                meanFirstLuma += firstDelta / sampleCountF;
+                float secondDelta = secondLuma - meanSecondLuma;
+                meanSecondLuma += secondDelta / sampleCountF;
+                firstLumaM2 += firstDelta * (firstLuma - meanFirstLuma);
+                secondLumaM2 += secondDelta * (secondLuma - meanSecondLuma);
+                lumaCovariance += firstDelta * (secondLuma - meanSecondLuma);
+            }
 
             if (firstEnergy < MinGradientEnergy || secondEnergy < MinGradientEnergy)
                 continue;
