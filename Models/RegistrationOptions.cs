@@ -52,12 +52,19 @@ namespace GPUStitch.Models
         public float ConfidenceThreshold { get; set; } = 0.03f;
 
         /// <summary>
+        /// 由 peak / round-trip / local drift 组合得到的几何可靠度阈值。
+        /// 低于该值时，即使总分不低，也视作“局部支持不一致”，回退到保守位移。
+        /// </summary>
+        public float GeometryConfidenceThreshold { get; set; } = 0.30f;
+
+        /// <summary>
         /// 根据图片尺寸和预估重叠量自动生成一组相对稳妥的参数。
         /// 当前先把水平/垂直重叠都初始化为同一个值，后续可以再独立细化。
         /// </summary>
         public static RegistrationOptions CreateForImages(
             IReadOnlyList<GpuImage> images,
-            int expectedOverlap)
+            int expectedOverlap,
+            float knownOverlapRatio = 0.0f)
         {
             if (images == null || images.Count == 0)
             {
@@ -77,8 +84,29 @@ namespace GPUStitch.Models
                 minHeight = Math.Min(minHeight, images[i].Height);
             }
 
-            int searchRangePrimary = Clamp(expectedOverlap / 2, 16, 192);
-            int searchRangeCross = Clamp(Math.Min(minWidth, minHeight) / 48, 6, 96);
+            int expectedHorizontalOverlap = expectedOverlap;
+            int expectedVerticalOverlap = expectedOverlap;
+
+            bool hasKnownOverlapRatio = knownOverlapRatio > 0.0f && knownOverlapRatio < 0.5f;
+            if (hasKnownOverlapRatio)
+            {
+                expectedHorizontalOverlap = Clamp(
+                    (int)Math.Round(minWidth * knownOverlapRatio),
+                    8,
+                    Math.Max(8, minWidth - 2));
+                expectedVerticalOverlap = Clamp(
+                    (int)Math.Round(minHeight * knownOverlapRatio),
+                    8,
+                    Math.Max(8, minHeight - 2));
+            }
+
+            int dominantOverlap = Math.Max(expectedHorizontalOverlap, expectedVerticalOverlap);
+            int searchRangePrimary = hasKnownOverlapRatio
+                ? Clamp(dominantOverlap / 6, 8, 64)
+                : Clamp(expectedOverlap / 2, 16, 192);
+            int searchRangeCross = hasKnownOverlapRatio
+                ? Clamp(Math.Min(minWidth, minHeight) / 128, 4, 24)
+                : Clamp(Math.Min(minWidth, minHeight) / 48, 6, 96);
             int sampleStep = minWidth >= 3500 || minHeight >= 3500 ? 3 : 2;
             int minSamples = sampleStep <= 2 ? 64 : 48;
             float minGradientEnergy = sampleStep <= 2 ? 0.00015f : 0.00010f;
@@ -86,17 +114,18 @@ namespace GPUStitch.Models
 
             return new RegistrationOptions
             {
-                ExpectedHorizontalOverlap = expectedOverlap,
-                ExpectedVerticalOverlap = expectedOverlap,
+                ExpectedHorizontalOverlap = expectedHorizontalOverlap,
+                ExpectedVerticalOverlap = expectedVerticalOverlap,
                 SearchRangePrimary = searchRangePrimary,
                 SearchRangeCross = searchRangeCross,
                 SampleStep = sampleStep,
                 MinSampleCount = minSamples,
                 MinGradientEnergy = minGradientEnergy,
                 MinLumaVariance = minLumaVariance,
-                GradientWeight = 0.40f,
-                LumaWeight = 0.60f,
+                GradientWeight = 0.20f,
+                LumaWeight = 0.80f,
                 ConfidenceThreshold = 0.03f,
+                GeometryConfidenceThreshold = 0.30f,
             };
         }
 

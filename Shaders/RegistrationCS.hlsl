@@ -35,9 +35,9 @@ cbuffer RegistrationParams : register(b0)
     float Padding1;
 };
 
-Texture2D<float4> FirstImage  : register(t0);
-Texture2D<float4> SecondImage : register(t1);
-RWTexture2D<float> ScoreMap   : register(u0);
+Texture2D<float4> FirstImage   : register(t0);
+Texture2D<float4> SecondImage  : register(t1);
+RWTexture2D<float4> ScoreMap   : register(u0);
 
 float ToLuma(float4 color)
 {
@@ -51,8 +51,18 @@ float SampleLuma(Texture2D<float4> image, int2 pixel)
 
 float2 ComputeGradient(Texture2D<float4> image, int2 pixel)
 {
-    float gx = SampleLuma(image, pixel + int2(1, 0)) - SampleLuma(image, pixel + int2(-1, 0));
-    float gy = SampleLuma(image, pixel + int2(0, 1)) - SampleLuma(image, pixel + int2(0, -1));
+    float p00 = SampleLuma(image, pixel + int2(-1, -1));
+    float p10 = SampleLuma(image, pixel + int2(0, -1));
+    float p20 = SampleLuma(image, pixel + int2(1, -1));
+    float p01 = SampleLuma(image, pixel + int2(-1, 0));
+    float p21 = SampleLuma(image, pixel + int2(1, 0));
+    float p02 = SampleLuma(image, pixel + int2(-1, 1));
+    float p12 = SampleLuma(image, pixel + int2(0, 1));
+    float p22 = SampleLuma(image, pixel + int2(1, 1));
+
+    //changed
+    float gx = ((p20 + (2.0 * p21) + p22) - (p00 + (2.0 * p01) + p02)) * 0.25;
+    float gy = ((p02 + (2.0 * p12) + p22) - (p00 + (2.0 * p10) + p20)) * 0.25;
     return float2(gx, gy);
 }
 
@@ -192,12 +202,14 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID)
 
             float firstEnergy = dot(firstGradient, firstGradient);
             float secondEnergy = dot(secondGradient, secondGradient);
-            float lumaTextureFloor = MinGradientEnergy * 0.25f;
+            float sharedEnergy = min(firstEnergy, secondEnergy);
+            float lumaTextureFloor = MinGradientEnergy * 0.5f;
 
-            if (firstEnergy >= lumaTextureFloor || secondEnergy >= lumaTextureFloor)
+            if (sharedEnergy >= lumaTextureFloor)
             {
                 // Shift the luma distribution closer to zero before the Welford update.
-                // This keeps intermediate values smaller and reduces flat-background dominance.
+                // This keeps intermediate values smaller and makes low-texture background
+                // less likely to dominate the luma score.
                 float firstLuma = SampleLuma(FirstImage, int2(x, y)) - 0.5f;
                 float secondLuma = SampleLuma(SecondImage, secondPixel) - 0.5f;
 
@@ -212,12 +224,15 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID)
                 lumaCovariance += firstDelta * (secondLuma - meanSecondLuma);
             }
 
-            if (firstEnergy < MinGradientEnergy || secondEnergy < MinGradientEnergy)
+            if (sharedEnergy < MinGradientEnergy)
                 continue;
 
-            sumDot += dot(firstGradient, secondGradient);
-            sumFirstGradient += firstEnergy;
-            sumSecondGradient += secondEnergy;
+            float energyWeight = sqrt(sharedEnergy / max(MinGradientEnergy, 1e-12));
+            energyWeight = min(energyWeight, 4.0f);
+
+            sumDot += dot(firstGradient, secondGradient) * energyWeight;
+            sumFirstGradient += firstEnergy * energyWeight;
+            sumSecondGradient += secondEnergy * energyWeight;
             gradientSampleCount++;
         }
     }
@@ -246,20 +261,32 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID)
 
     bool hasGradientScore = gradientScore > -1.5;
     bool hasLumaScore = lumaScore > -1.5;
+    float gradientCoverage = lumaSampleCount > 0
+        ? saturate((float)gradientSampleCount / max((float)lumaSampleCount, 1.0))
+        : saturate((float)gradientSampleCount / max((float)MinSampleCount, 1.0));
+    float gradientReliability = saturate((gradientScore + 0.02) / 0.18);
+    float adaptiveGradientWeight = hasGradientScore
+        ? GradientWeight * gradientCoverage * gradientReliability
+        : 0.0;
+    float adaptiveLumaWeight = hasLumaScore ? LumaWeight : 0.0;
 
-    if (hasGradientScore && hasLumaScore)
+    if (adaptiveLumaWeight > 0.0 && adaptiveGradientWeight > 1e-5)
     {
-        float totalWeight = max(GradientWeight + LumaWeight, 1e-5);
-        finalScore = ((gradientScore * GradientWeight) + (lumaScore * LumaWeight)) / totalWeight;
+        float totalWeight = max(adaptiveGradientWeight + adaptiveLumaWeight, 1e-5);
+        finalScore = ((gradientScore * adaptiveGradientWeight) + (lumaScore * adaptiveLumaWeight)) / totalWeight;
+    }
+    else if (adaptiveLumaWeight > 0.0)
+    {
+        finalScore = lumaScore;
     }
     else if (hasGradientScore)
     {
         finalScore = gradientScore;
     }
-    else if (hasLumaScore)
-    {
-        finalScore = lumaScore;
-    }
 
-    ScoreMap[int2(candidateX, candidateY)] = finalScore;
+    ScoreMap[int2(candidateX, candidateY)] = float4(
+        finalScore,
+        gradientScore,
+        lumaScore,
+        gradientCoverage);
 }

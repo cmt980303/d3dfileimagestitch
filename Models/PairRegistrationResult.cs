@@ -102,5 +102,29 @@ namespace GPUStitch.Models
         /// 与当前配准结果相关的诊断指标。
         /// </summary>
         public PairRegistrationDiagnostics Diagnostics { get; }
+
+        /// <summary>
+        /// 由峰值唯一性、正反向自洽性和局部一致性共同决定的几何可靠度。
+        /// </summary>
+        public float GeometryReliability => Diagnostics.GeometryReliability;
+
+        public PairRegistrationResult Scale(float scale)
+        {
+            if (System.Math.Abs(scale - 1.0f) < 1e-6f)
+                return this;
+
+            return new PairRegistrationResult(
+                SourceIndex,
+                TargetIndex,
+                Axis,
+                BestDeltaX * scale,
+                BestDeltaY * scale,
+                Score,
+                System.Math.Max(1, (int)System.Math.Round(OverlapSize * scale)),
+                RelativeOffsetX * scale,
+                RelativeOffsetY * scale,
+                IsConfident,
+                Diagnostics.Scale(scale));
+        }
     }
 }

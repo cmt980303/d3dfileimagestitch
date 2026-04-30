@@ -3,6 +3,7 @@ using GPUStitch.Models;
 using Microsoft.Win32;
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Globalization;
 using System.IO;
 using System.Text;
@@ -23,7 +24,7 @@ namespace GPUStitch
     /// 1. 读取文件并探测元数据；
     /// 2. 基于预算生成预览加载方案；
     /// 3. 逐张异步加载图片并触发渐进式预览；
-    /// 4. 在用户需要时调用 GPU 配准器求全局布局；
+        /// 4. 在用户需要时调用配准器求全局布局；
     /// 5. 再把布局交给 GPU 拼图器输出最终预览。
     ///
     /// 之所以把这些流程放在窗口层统一调度，是因为它们和 UI 状态、
@@ -60,8 +61,21 @@ namespace GPUStitch
         /// 这里故意保持较低并发，目的是降低磁盘、CPU 解码和显存上传同时峰值。
         /// </summary>
         private const int MaxParallelLoads = 10;
+        private const float KnownMicroscopeOverlapRatio = 0.10f;
 
-        // ===== GPU 核心模块 =====
+        /// <summary>
+        /// 精配准阶段允许使用的临时纹理预算。
+        /// 这部分资源不会长期常驻，只在用户点击“配准 + GPU 拼图”时短暂存在。
+        /// </summary>
+        private const long RegistrationTextureBudgetBytes = 768L * 1024L * 1024L;
+
+        /// <summary>
+        /// 精配准阶段单张图片允许使用的更高边长。
+        /// 它高于预览链路的常驻限制，但仍保留上限以控制临时资源压力。
+        /// </summary>
+        private const int MaxPerImageRegistrationDimension = 4096;
+
+        // ===== 核心图像模块 =====
         private D3DDeviceManager? _deviceManager;
         private GpuImageLoader? _imageLoader;
         private GpuStitcher? _stitcher;
@@ -118,7 +132,6 @@ namespace GPUStitch
                 _stitcher = new GpuStitcher(_deviceManager);
                 _stitcher.Initialize();
                 _registration = new GpuRegistration(_deviceManager);
-                _registration.Initialize();
 
                 _gpuInitialized = true;
 
@@ -224,7 +237,7 @@ namespace GPUStitch
 
         /// <summary>
         /// 最终精配准。
-        /// 当前会基于“已经完成导入”的缩放图像做 GPU 配准，再刷新显示布局。
+        /// 当前会基于“已经完成导入”的缩放图像做相位相关精配准，再刷新显示布局。
         /// </summary>
         private async void BtnStitch_Click(object sender, RoutedEventArgs e)
         {
@@ -247,17 +260,13 @@ namespace GPUStitch
                 BtnStitch.IsEnabled = false;
                 BtnRecommend.IsEnabled = false;
                 BtnLoadImages.IsEnabled = false;
-                UpdateStatus("正在执行 GPU 配准...");
+                UpdateStatus("正在执行相位相关配准...");
 
-                int overlapPixels = (int)SliderOverlap.Value;
+                int overlapPixels = GetCurrentOverlapPixelsOrDefault(images);
                 float blendWidth = (float)SliderBlendWidth.Value;
-
-                var registrationOptions =
-                    RegistrationOptions.CreateForImages(images, overlapPixels);
-
-                // 配准是纯计算任务，放到后台线程执行，避免阻塞 UI 线程。
-                var layout = await Task.Run(() =>
-                    _registration!.ComputeLayout(images, registrationOptions));
+                var registrationResult = await Task.Run(() =>
+                    ComputeBestAvailableRegistrationLayout(images, overlapPixels));
+                var layout = registrationResult.Layout;
 
                 if (layout.CanvasWidth <= 0 || layout.CanvasHeight <= 0)
                 {
@@ -286,19 +295,22 @@ namespace GPUStitch
                 string previewSuffix = preview.Scale < 0.999f
                     ? $", 预览缩放 {preview.Scale:F3}"
                     : string.Empty;
+                string registrationSuffix = registrationResult.RegistrationScale > _currentLoadPlan.Scale + 0.001f
+                    ? $", 配准重载 {registrationResult.RegistrationScale:F3}x"
+                    : string.Empty;
                 _lastRegistrationDiagnosticsReport = BuildRegistrationDiagnosticsReport(layout);
                 BtnDiagnostics.IsEnabled = layout.PairResults.Count > 0;
 
                 UpdateStatus(
                     $"配准并拼图完成: {layout.CanvasWidth}×{layout.CanvasHeight}, " +
-                    $"平均分 {layout.AverageScore:F3}, 可信 {layout.ConfidentPairCount}/{layout.PairResults.Count}, " +
-                    $"回退 {fallbackPairs} 对, 弱峰 {layout.WeakPeakPairCount} 对, " +
-                    $"反向不一致 {layout.RoundTripMismatchPairCount} 对, 漂移 {layout.LocalDriftPairCount} 对{previewSuffix}");
+                    $"平均相位响应 {layout.AverageScore:F3}, 可信 {layout.ConfidentPairCount}/{layout.PairResults.Count}, " +
+                    $"几何可靠度 {layout.AverageGeometryReliability:F3}, 回退 {fallbackPairs} 对, 弱峰 {layout.WeakPeakPairCount} 对, " +
+                    $"反向不一致 {layout.RoundTripMismatchPairCount} 对, 漂移 {layout.LocalDriftPairCount} 对{registrationSuffix}{previewSuffix}");
             }
             catch (Exception ex)
             {
                 MessageBox.Show(
-                    $"GPU 配准/拼图失败:\n{ex.Message}",
+                    $"配准/拼图失败:\n{ex.Message}",
                     "错误",
                     MessageBoxButton.OK,
                     MessageBoxImage.Error);
@@ -336,12 +348,12 @@ namespace GPUStitch
                 MessageBox.Show("当前还没有可用的配准诊断结果。", "提示");
                 return;
             }
-            Console.WriteLine(_lastRegistrationDiagnosticsReport);
-            MessageBox.Show(
-                _lastRegistrationDiagnosticsReport,
-                "配准诊断",
-                MessageBoxButton.OK,
-                MessageBoxImage.Information);
+            Debug.WriteLine(_lastRegistrationDiagnosticsReport);
+            //MessageBox.Show(
+                //_lastRegistrationDiagnosticsReport,
+                //"配准诊断",
+                //MessageBoxButton.OK,
+                //MessageBoxImage.Information);
         }
 
         /// <summary>
@@ -674,7 +686,11 @@ namespace GPUStitch
 
             _currentLoadPlan = loadPlan;
 
-            int overlapPixels = Math.Max(16, (int)SliderOverlap.Value);
+            int overlapPixels = GetPreviewOverlapPixels(metadata, loadPlan.Scale);
+            SliderOverlap.Value = ClampForSlider(
+                overlapPixels,
+                SliderOverlap.Minimum,
+                SliderOverlap.Maximum);
             float blendWidth = (float)SliderBlendWidth.Value;
 
             // 先用命名规则/默认重叠构建“粗布局”，
@@ -863,6 +879,151 @@ namespace GPUStitch
                 canvasWidth,
                 (int)Math.Ceiling(maxHeight),
                 new List<PairRegistrationResult>());
+        }
+
+        private RegistrationExecutionResult ComputeBestAvailableRegistrationLayout(
+            IReadOnlyList<GpuImage> previewImages,
+            int overlapPixels)
+        {
+            if (_registration == null)
+                throw new InvalidOperationException("配准器尚未初始化。");
+
+            float previewScale = _currentLoadPlan.Scale > 0.0f
+                ? _currentLoadPlan.Scale
+                : 1.0f;
+
+            List<GpuImage>? registrationImages = null;
+            float registrationScale = previewScale;
+
+            try
+            {
+                var metadata = BuildLoadedImageMetadata(previewImages);
+                var registrationPlan = ImageLoadPlanner.Build(
+                    metadata,
+                    RegistrationTextureBudgetBytes,
+                    MaxPerImageRegistrationDimension);
+
+                IReadOnlyList<GpuImage> imagesForRegistration = previewImages;
+                if (registrationPlan.Scale > previewScale + 0.01f)
+                {
+                    registrationImages = LoadImagesForRegistration(metadata, registrationPlan.Scale);
+                    imagesForRegistration = registrationImages;
+                    registrationScale = registrationPlan.Scale;
+                }
+
+                int registrationOverlap = Math.Max(
+                    8,
+                    (int)Math.Round(overlapPixels * (registrationScale / Math.Max(previewScale, 1e-6f))));
+
+                var registrationOptions =
+                    RegistrationOptions.CreateForImages(
+                        imagesForRegistration,
+                        registrationOverlap,
+                        KnownMicroscopeOverlapRatio);
+
+                var layout = _registration.ComputeLayout(imagesForRegistration, registrationOptions);
+                if (registrationScale > previewScale + 0.001f)
+                {
+                    layout = layout.Scale(previewScale / registrationScale);
+                }
+
+                return new RegistrationExecutionResult(layout, registrationScale);
+            }
+            finally
+            {
+                if (registrationImages != null)
+                {
+                    for (int i = 0; i < registrationImages.Count; i++)
+                    {
+                        registrationImages[i].Dispose();
+                    }
+                }
+            }
+        }
+
+        private List<ImageFileMetadata> BuildLoadedImageMetadata(IReadOnlyList<GpuImage> images)
+        {
+            var metadataByPath = new Dictionary<string, ImageFileMetadata>(StringComparer.OrdinalIgnoreCase);
+            for (int i = 0; i < _loadedMetadata.Count; i++)
+            {
+                metadataByPath[_loadedMetadata[i].FilePath] = _loadedMetadata[i];
+            }
+
+            var metadata = new List<ImageFileMetadata>(images.Count);
+            for (int i = 0; i < images.Count; i++)
+            {
+                string filePath = images[i].FilePath;
+                if (metadataByPath.TryGetValue(filePath, out var existing))
+                {
+                    metadata.Add(existing);
+                }
+                else
+                {
+                    metadata.Add(GpuImageLoader.ProbeFile(filePath));
+                }
+            }
+
+            return metadata;
+        }
+
+        private int GetCurrentOverlapPixelsOrDefault(IReadOnlyList<GpuImage> images)
+        {
+            if (KnownMicroscopeOverlapRatio > 0.0f && images.Count > 0)
+            {
+                int minDimension = int.MaxValue;
+                for (int i = 0; i < images.Count; i++)
+                {
+                    minDimension = Math.Min(minDimension, Math.Min(images[i].Width, images[i].Height));
+                }
+
+                if (minDimension != int.MaxValue)
+                {
+                    return Math.Max(16, (int)Math.Round(minDimension * KnownMicroscopeOverlapRatio));
+                }
+            }
+
+            return Math.Max(16, (int)SliderOverlap.Value);
+        }
+
+        private int GetPreviewOverlapPixels(
+            IReadOnlyList<ImageFileMetadata> metadata,
+            float imageScale)
+        {
+            if (KnownMicroscopeOverlapRatio > 0.0f && metadata.Count > 0)
+            {
+                float minScaledDimension = float.MaxValue;
+                for (int i = 0; i < metadata.Count; i++)
+                {
+                    float scaledWidth = Math.Max(1.0f, metadata[i].PixelWidth * imageScale);
+                    float scaledHeight = Math.Max(1.0f, metadata[i].PixelHeight * imageScale);
+                    minScaledDimension = Math.Min(minScaledDimension, Math.Min(scaledWidth, scaledHeight));
+                }
+
+                if (minScaledDimension < float.MaxValue)
+                {
+                    return Math.Max(16, (int)Math.Round(minScaledDimension * KnownMicroscopeOverlapRatio));
+                }
+            }
+
+            return Math.Max(16, (int)SliderOverlap.Value);
+        }
+
+        private List<GpuImage> LoadImagesForRegistration(
+            IReadOnlyList<ImageFileMetadata> metadata,
+            float scale)
+        {
+            if (_imageLoader == null)
+                throw new InvalidOperationException("图片加载器尚未初始化。");
+
+            var images = new List<GpuImage>(metadata.Count);
+            for (int i = 0; i < metadata.Count; i++)
+            {
+                var image = _imageLoader.LoadFromFile(metadata[i].FilePath, scale);
+                image.FilePath = metadata[i].FilePath;
+                images.Add(image);
+            }
+
+            return images;
         }
 
         /// <summary>
@@ -1062,8 +1223,9 @@ namespace GPUStitch
                 return;
             }
 
+            int overlapPixels = GetCurrentOverlapPixelsOrDefault(loadedImages);
             SliderOverlap.Value = ClampForSlider(
-                recommendation.OverlapPixels,
+                overlapPixels,
                 SliderOverlap.Minimum,
                 SliderOverlap.Maximum);
 
@@ -1076,7 +1238,7 @@ namespace GPUStitch
             {
                 string confidence = recommendation.Confidence.ToString("F3", CultureInfo.InvariantCulture);
                 UpdateStatus(
-                    $"已加载 {loadedImages.Count} 张图片，推荐参数：重叠 {recommendation.OverlapPixels}px，" +
+                    $"已加载 {loadedImages.Count} 张图片，推荐参数：重叠 {overlapPixels}px，" +
                     $"混合 {recommendation.BlendWidth}px，推荐置信 {confidence}，评估 {recommendation.EvaluatedPairCount} 对");
             }
         }
@@ -1220,10 +1382,12 @@ namespace GPUStitch
             builder.AppendLine("整体诊断");
             builder.AppendLine($"- 配准边数: {layout.PairResults.Count}");
             builder.AppendLine($"- 可信边: {layout.ConfidentPairCount}/{layout.PairResults.Count}");
-            builder.AppendLine($"- 平均分: {layout.AverageScore:F4}");
+            builder.AppendLine($"- 平均相位响应: {layout.AverageScore:F4}");
+            builder.AppendLine($"- 平均相位覆盖率: {layout.AverageGradientCoverage:F4}");
             builder.AppendLine($"- 平均峰值优势: {layout.AveragePeakMargin:F4}");
             builder.AppendLine($"- 平均正反向残差: {layout.AverageRoundTripError:F2}px");
             builder.AppendLine($"- 平均局部漂移: {layout.AverageLocalDrift:F2}px");
+            builder.AppendLine($"- 平均几何可靠度: {layout.AverageGeometryReliability:F4}");
             builder.AppendLine($"- 弱峰值边: {layout.WeakPeakPairCount}");
             builder.AppendLine($"- 正反向不一致边: {layout.RoundTripMismatchPairCount}");
             builder.AppendLine($"- 分段漂移边: {layout.LocalDriftPairCount}");
@@ -1236,9 +1400,9 @@ namespace GPUStitch
                 var diagnostics = pair.Diagnostics;
                 builder.AppendLine(
                     $"[{pair.SourceIndex}->{pair.TargetIndex}] {pair.Axis} " +
-                    $"score={pair.Score:F4}, peak={diagnostics.PeakMargin:F4}, " +
+                    $"phase={pair.Score:F4}, cov={diagnostics.GradientCoverage:F3}, peak={diagnostics.PeakMargin:F4}, " +
                     $"roundTrip={diagnostics.RoundTripErrorMagnitude:F2}px, " +
-                    $"drift={diagnostics.SegmentSpreadMagnitude:F2}px, " +
+                    $"drift={diagnostics.SegmentSpreadMagnitude:F2}px, geomRel={diagnostics.GeometryReliability:F3}, " +
                     $"segments={diagnostics.ValidSegmentCount}, " +
                     $"flags={BuildDiagnosticFlags(diagnostics)}");
             }
@@ -1379,6 +1543,18 @@ namespace GPUStitch
             public List<ImagePlacement> Placements { get; }
             public float BlendWidth { get; }
             public float Scale { get; }
+        }
+
+        private sealed class RegistrationExecutionResult
+        {
+            public RegistrationExecutionResult(RegistrationLayout layout, float registrationScale)
+            {
+                Layout = layout;
+                RegistrationScale = registrationScale;
+            }
+
+            public RegistrationLayout Layout { get; }
+            public float RegistrationScale { get; }
         }
 
         /// <summary>

@@ -1,3 +1,4 @@
+using System;
 using System.Collections.Generic;
 
 namespace GPUStitch.Models
@@ -129,6 +130,86 @@ namespace GPUStitch.Models
             }
         }
 
+        public float AverageGradientScore
+        {
+            get
+            {
+                if (PairResults.Count == 0)
+                    return 0;
+
+                float sum = 0;
+                for (int i = 0; i < PairResults.Count; i++)
+                {
+                    sum += PairResults[i].Diagnostics.GradientScore;
+                }
+                return sum / PairResults.Count;
+            }
+        }
+
+        public float AverageLumaScore
+        {
+            get
+            {
+                if (PairResults.Count == 0)
+                    return 0;
+
+                float sum = 0;
+                for (int i = 0; i < PairResults.Count; i++)
+                {
+                    sum += PairResults[i].Diagnostics.LumaScore;
+                }
+                return sum / PairResults.Count;
+            }
+        }
+
+        public float AverageBestGradientCandidateScore
+        {
+            get
+            {
+                if (PairResults.Count == 0)
+                    return 0;
+
+                float sum = 0;
+                for (int i = 0; i < PairResults.Count; i++)
+                {
+                    sum += PairResults[i].Diagnostics.BestGradientCandidateScore;
+                }
+                return sum / PairResults.Count;
+            }
+        }
+
+        public float AverageBestLumaCandidateScore
+        {
+            get
+            {
+                if (PairResults.Count == 0)
+                    return 0;
+
+                float sum = 0;
+                for (int i = 0; i < PairResults.Count; i++)
+                {
+                    sum += PairResults[i].Diagnostics.BestLumaCandidateScore;
+                }
+                return sum / PairResults.Count;
+            }
+        }
+
+        public float AverageGradientCoverage
+        {
+            get
+            {
+                if (PairResults.Count == 0)
+                    return 0;
+
+                float sum = 0;
+                for (int i = 0; i < PairResults.Count; i++)
+                {
+                    sum += PairResults[i].Diagnostics.GradientCoverage;
+                }
+                return sum / PairResults.Count;
+            }
+        }
+
         public float AverageRoundTripError
         {
             get
@@ -159,6 +240,57 @@ namespace GPUStitch.Models
                 }
                 return sum / PairResults.Count;
             }
+        }
+
+        public float AverageGeometryReliability
+        {
+            get
+            {
+                if (PairResults.Count == 0)
+                    return 0;
+
+                float sum = 0;
+                for (int i = 0; i < PairResults.Count; i++)
+                {
+                    sum += PairResults[i].GeometryReliability;
+                }
+                return sum / PairResults.Count;
+            }
+        }
+
+        public RegistrationLayout Scale(float scale)
+        {
+            if (Math.Abs(scale - 1.0f) < 1e-6f)
+                return this;
+
+            var placements = new List<ImagePlacement>(Placements.Count);
+            for (int i = 0; i < Placements.Count; i++)
+            {
+                var placement = Placements[i];
+                placements.Add(new ImagePlacement
+                {
+                    OffsetX = placement.OffsetX * scale,
+                    OffsetY = placement.OffsetY * scale,
+                    Width = placement.Width * scale,
+                    Height = placement.Height * scale,
+                    FeatherLeft = placement.FeatherLeft * scale,
+                    FeatherRight = placement.FeatherRight * scale,
+                    FeatherTop = placement.FeatherTop * scale,
+                    FeatherBottom = placement.FeatherBottom * scale,
+                });
+            }
+
+            var pairResults = new List<PairRegistrationResult>(PairResults.Count);
+            for (int i = 0; i < PairResults.Count; i++)
+            {
+                pairResults.Add(PairResults[i].Scale(scale));
+            }
+
+            return new RegistrationLayout(
+                placements,
+                Math.Max(1, (int)Math.Ceiling(CanvasWidth * scale)),
+                Math.Max(1, (int)Math.Ceiling(CanvasHeight * scale)),
+                pairResults);
         }
     }
 }

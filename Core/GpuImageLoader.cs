@@ -81,7 +81,9 @@ namespace GPUStitch.Core
             byte[] pixels = new byte[height * stride];
             convertedBitmap.CopyPixels(pixels, stride, 0);
 
-            return CreateTextureFromPixels(pixels, width, height, stride);
+            var image = CreateTextureFromPixels(pixels, width, height, stride);
+            image.FilePath = filePath;
+            return image;
         }
 
         /// <summary>
