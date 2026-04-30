@@ -49,6 +49,11 @@
                 Click="BtnRecommend_Click"
                 Content="✨ 智能推荐"
                 IsEnabled="False" />
+            <Button
+                x:Name="BtnDiagnostics"
+                Click="BtnDiagnostics_Click"
+                Content="📊 配准诊断"
+                IsEnabled="False" />
             <!--  显示单张图片按钮  -->
             <Button
                 x:Name="BtnShowSingle"

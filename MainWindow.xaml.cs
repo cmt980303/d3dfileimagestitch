@@ -5,6 +5,7 @@ using System;
 using System.Collections.Generic;
 using System.Globalization;
 using System.IO;
+using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Windows;
@@ -91,6 +92,7 @@ namespace GPUStitch
         private List<ImagePlacement> _currentPlacements = new List<ImagePlacement>();
         private int _currentCanvasWidth;
         private int _currentCanvasHeight;
+        private string _lastRegistrationDiagnosticsReport = string.Empty;
 
         public MainWindow()
         {
@@ -284,11 +286,14 @@ namespace GPUStitch
                 string previewSuffix = preview.Scale < 0.999f
                     ? $", 预览缩放 {preview.Scale:F3}"
                     : string.Empty;
+                _lastRegistrationDiagnosticsReport = BuildRegistrationDiagnosticsReport(layout);
+                BtnDiagnostics.IsEnabled = layout.PairResults.Count > 0;
 
                 UpdateStatus(
                     $"配准并拼图完成: {layout.CanvasWidth}×{layout.CanvasHeight}, " +
                     $"平均分 {layout.AverageScore:F3}, 可信 {layout.ConfidentPairCount}/{layout.PairResults.Count}, " +
-                    $"回退 {fallbackPairs} 对{previewSuffix}");
+                    $"回退 {fallbackPairs} 对, 弱峰 {layout.WeakPeakPairCount} 对, " +
+                    $"反向不一致 {layout.RoundTripMismatchPairCount} 对, 漂移 {layout.LocalDriftPairCount} 对{previewSuffix}");
             }
             catch (Exception ex)
             {
@@ -322,6 +327,21 @@ namespace GPUStitch
             }
 
             await ApplyRecommendedParametersAsync(showStatus: true);
+        }
+
+        private void BtnDiagnostics_Click(object sender, RoutedEventArgs e)
+        {
+            if (string.IsNullOrWhiteSpace(_lastRegistrationDiagnosticsReport))
+            {
+                MessageBox.Show("当前还没有可用的配准诊断结果。", "提示");
+                return;
+            }
+            Console.WriteLine(_lastRegistrationDiagnosticsReport);
+            MessageBox.Show(
+                _lastRegistrationDiagnosticsReport,
+                "配准诊断",
+                MessageBoxButton.OK,
+                MessageBoxImage.Information);
         }
 
         /// <summary>
@@ -372,6 +392,7 @@ namespace GPUStitch
             _renderMode = RenderMode.None;
             _sharedRenderTarget = null;
             BtnStitch.IsEnabled = false;
+            BtnDiagnostics.IsEnabled = false;
             BtnRecommend.IsEnabled = false;
             BtnShowSingle.IsEnabled = false;
             BtnLoadImages.IsEnabled = true;
@@ -1128,6 +1149,7 @@ namespace GPUStitch
             _currentCanvasHeight = 0;
             _canvasPrepared = false;
             _accumulatedIndices.Clear();
+            _lastRegistrationDiagnosticsReport = string.Empty;
         }
 
         /// <summary>
@@ -1160,6 +1182,7 @@ namespace GPUStitch
             BtnLoadImages.IsEnabled = !isLoading;
             BtnStitch.IsEnabled = !isLoading && GetLoadedImagesInOrder().Count >= 2;
             BtnRecommend.IsEnabled = !isLoading && GetLoadedImagesInOrder().Count >= 2;
+            BtnDiagnostics.IsEnabled = !isLoading && !string.IsNullOrWhiteSpace(_lastRegistrationDiagnosticsReport);
             BtnShowSingle.IsEnabled = GetLoadedImagesInOrder().Count >= 1;
         }
 
@@ -1189,6 +1212,52 @@ namespace GPUStitch
             if (value > max)
                 return max;
             return value;
+        }
+
+        private static string BuildRegistrationDiagnosticsReport(RegistrationLayout layout)
+        {
+            var builder = new StringBuilder();
+            builder.AppendLine("整体诊断");
+            builder.AppendLine($"- 配准边数: {layout.PairResults.Count}");
+            builder.AppendLine($"- 可信边: {layout.ConfidentPairCount}/{layout.PairResults.Count}");
+            builder.AppendLine($"- 平均分: {layout.AverageScore:F4}");
+            builder.AppendLine($"- 平均峰值优势: {layout.AveragePeakMargin:F4}");
+            builder.AppendLine($"- 平均正反向残差: {layout.AverageRoundTripError:F2}px");
+            builder.AppendLine($"- 平均局部漂移: {layout.AverageLocalDrift:F2}px");
+            builder.AppendLine($"- 弱峰值边: {layout.WeakPeakPairCount}");
+            builder.AppendLine($"- 正反向不一致边: {layout.RoundTripMismatchPairCount}");
+            builder.AppendLine($"- 分段漂移边: {layout.LocalDriftPairCount}");
+            builder.AppendLine();
+            builder.AppendLine("逐边诊断");
+
+            for (int i = 0; i < layout.PairResults.Count; i++)
+            {
+                var pair = layout.PairResults[i];
+                var diagnostics = pair.Diagnostics;
+                builder.AppendLine(
+                    $"[{pair.SourceIndex}->{pair.TargetIndex}] {pair.Axis} " +
+                    $"score={pair.Score:F4}, peak={diagnostics.PeakMargin:F4}, " +
+                    $"roundTrip={diagnostics.RoundTripErrorMagnitude:F2}px, " +
+                    $"drift={diagnostics.SegmentSpreadMagnitude:F2}px, " +
+                    $"segments={diagnostics.ValidSegmentCount}, " +
+                    $"flags={BuildDiagnosticFlags(diagnostics)}");
+            }
+
+            return builder.ToString();
+        }
+
+        private static string BuildDiagnosticFlags(PairRegistrationDiagnostics diagnostics)
+        {
+            var flags = new List<string>(3);
+
+            if (diagnostics.HasWeakPeak)
+                flags.Add("weak-peak");
+            if (diagnostics.HasRoundTripMismatch)
+                flags.Add("round-trip");
+            if (diagnostics.HasLocalDrift)
+                flags.Add("local-drift");
+
+            return flags.Count == 0 ? "ok" : string.Join(",", flags);
         }
 
         /// <summary>

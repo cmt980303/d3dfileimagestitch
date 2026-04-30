@@ -33,7 +33,8 @@ namespace GPUStitch.Models
             int overlapSize,
             int relativeOffsetX,
             int relativeOffsetY,
-            bool isConfident)
+            bool isConfident,
+            PairRegistrationDiagnostics diagnostics)
         {
             SourceIndex = sourceIndex;
             TargetIndex = targetIndex;
@@ -45,6 +46,7 @@ namespace GPUStitch.Models
             RelativeOffsetX = relativeOffsetX;
             RelativeOffsetY = relativeOffsetY;
             IsConfident = isConfident;
+            Diagnostics = diagnostics;
         }
 
         /// <summary>源图索引。水平配准时为左图，垂直配准时为上图。</summary>
@@ -95,5 +97,10 @@ namespace GPUStitch.Models
         /// 如果为 false，通常意味着本次结果已经回退到更保守的预估位移。
         /// </summary>
         public bool IsConfident { get; }
+
+        /// <summary>
+        /// 与当前配准结果相关的诊断指标。
+        /// </summary>
+        public PairRegistrationDiagnostics Diagnostics { get; }
     }
 }

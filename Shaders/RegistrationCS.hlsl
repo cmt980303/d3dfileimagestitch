@@ -2,8 +2,9 @@
 // RegistrationCS.hlsl - hybrid GPU registration
 // ============================================================
 // This shader evaluates one candidate offset per thread and writes
-// the score into ScoreMap. It supports both horizontal neighbors
-// (left -> right) and vertical neighbors (top -> bottom).
+// the score into ScoreMap. It supports both forward and reverse
+// searches for horizontal / vertical neighbors, and can optionally
+// restrict sampling to a cross-axis sub-range for diagnostics.
 // ============================================================
 
 cbuffer RegistrationParams : register(b0)
@@ -18,15 +19,15 @@ cbuffer RegistrationParams : register(b0)
     int   SearchRangeY;
     int   SampleStep;
 
-    int   Orientation;       // 0 = horizontal, 1 = vertical
+    int   Orientation;       // 0 = H forward, 1 = V forward, 2 = H reverse, 3 = V reverse
     int   MinSampleCount;
+    int   RegionStart;
+    int   RegionEnd;
     float MinGradientEnergy;
     float MinLumaVariance;
 
     float GradientWeight;
     float LumaWeight;
-    float Padding0;
-    float Padding1;
 };
 
 Texture2D<float4> FirstImage  : register(t0);
@@ -65,12 +66,37 @@ void ComputeOverlapBounds(
         yStart = max(1, -deltaY + 1);
         yEnd = min(FirstHeight - 1, SecondHeight - deltaY - 1);
     }
-    else
+    else if (Orientation == 1)
     {
         xStart = max(1, -deltaX + 1);
         xEnd = min(FirstWidth - 1, SecondWidth - deltaX - 1);
         yStart = max(1, FirstHeight - OverlapSize);
         yEnd = FirstHeight - 1;
+    }
+    else if (Orientation == 2)
+    {
+        xStart = 1;
+        xEnd = min(FirstWidth - 1, OverlapSize);
+        yStart = max(1, -deltaY + 1);
+        yEnd = min(FirstHeight - 1, SecondHeight - deltaY - 1);
+    }
+    else
+    {
+        xStart = max(1, -deltaX + 1);
+        xEnd = min(FirstWidth - 1, SecondWidth - deltaX - 1);
+        yStart = 1;
+        yEnd = min(FirstHeight - 1, OverlapSize);
+    }
+
+    if (Orientation == 0 || Orientation == 2)
+    {
+        yStart = max(yStart, RegionStart);
+        yEnd = min(yEnd, RegionEnd);
+    }
+    else
+    {
+        xStart = max(xStart, RegionStart);
+        xEnd = min(xEnd, RegionEnd);
     }
 }
 
@@ -87,11 +113,23 @@ bool ComputeSecondPixel(
             firstX - (FirstWidth - OverlapSize) + deltaX,
             firstY + deltaY);
     }
-    else
+    else if (Orientation == 1)
     {
         secondPixel = int2(
             firstX + deltaX,
             firstY - (FirstHeight - OverlapSize) + deltaY);
+    }
+    else if (Orientation == 2)
+    {
+        secondPixel = int2(
+            (SecondWidth - OverlapSize) + firstX + deltaX,
+            firstY + deltaY);
+    }
+    else
+    {
+        secondPixel = int2(
+            firstX + deltaX,
+            (SecondHeight - OverlapSize) + firstY + deltaY);
     }
 
     return secondPixel.x > 0 && secondPixel.x < (SecondWidth - 1) &&

@@ -25,12 +25,12 @@ namespace GPUStitch.Core
 
         public int Orientation;
         public int MinSampleCount;
+        public int RegionStart;
+        public int RegionEnd;
+
         public float MinGradientEnergy;
         public float MinLumaVariance;
-
         public float GradientWeight;
         public float LumaWeight;
-        public float Padding0;
-        public float Padding1;
     }
 }

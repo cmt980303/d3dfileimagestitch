@@ -125,26 +125,82 @@ namespace GPUStitch.Core
                 ? Clamp(options.ExpectedHorizontalOverlap, 8, Math.Min(first.Width, second.Width) - 2)
                 : Clamp(options.ExpectedVerticalOverlap, 8, Math.Min(first.Height, second.Height) - 2);
 
-            // 根据配准方向分配搜索范围：
-            // 水平配准(左→右)：X 是主轴(大范围)，Y 是交叉轴(小范围)
-            // 垂直配准(上→下)：Y 是主轴(大范围)，X 是交叉轴(小范围)
-            int searchRangeX, searchRangeY;
-            if (axis == RegistrationAxis.Horizontal)
+            SearchOrientation forwardOrientation = axis == RegistrationAxis.Horizontal
+                ? SearchOrientation.HorizontalForward
+                : SearchOrientation.VerticalForward;
+
+            var best = RunSearch(
+                first,
+                second,
+                overlapSize,
+                options,
+                forwardOrientation,
+                SearchRegion.Full);
+
+            (int relativeOffsetX, int relativeOffsetY) = ComputeRelativeOffset(
+                best.BestDeltaX,
+                best.BestDeltaY,
+                first,
+                second,
+                overlapSize,
+                forwardOrientation);
+
+            bool isConfident = best.Score >= options.ConfidenceThreshold;
+            if (!isConfident)
             {
-                searchRangeX = options.SearchRangePrimary;
-                searchRangeY = options.SearchRangeCross;
-            }
-            else
-            {
-                searchRangeX = options.SearchRangeCross;
-                searchRangeY = options.SearchRangePrimary;
+                // 当相关性不可信时，系统退回到“仅根据预估重叠得到的保守位移”。
+                // 这样至少能维持整体布局连续，而不是让单条错误边把全局结果拉崩。
+                (relativeOffsetX, relativeOffsetY) = CreateFallbackOffset(first, overlapSize, axis);
             }
 
+            var diagnostics = BuildDiagnostics(
+                first,
+                second,
+                overlapSize,
+                options,
+                axis,
+                best,
+                relativeOffsetX,
+                relativeOffsetY);
+
+            var result = new PairRegistrationResult(
+                sourceIndex,
+                targetIndex,
+                axis,
+                best.BestDeltaX,
+                best.BestDeltaY,
+                best.Score,
+                overlapSize,
+                relativeOffsetX,
+                relativeOffsetY,
+                isConfident,
+                diagnostics);
+
+            Debug.WriteLine(
+                $"[Registration] 配准 [{sourceIndex}]->[{targetIndex}] {axis}: " +
+                $"score={best.Score:F4}, delta=({best.BestDeltaX},{best.BestDeltaY}), " +
+                $"offset=({relativeOffsetX},{relativeOffsetY}), overlap={overlapSize}, " +
+                $"peakMargin={diagnostics.PeakMargin:F4}, roundTrip={diagnostics.RoundTripErrorMagnitude:F2}px, " +
+                $"localDrift={diagnostics.SegmentSpreadMagnitude:F2}px, " +
+                $"confident={isConfident}{(isConfident ? "" : " [FALLBACK]")}");
+
+            return result;
+        }
+
+        private BestScoreResult RunSearch(
+            GpuImage first,
+            GpuImage second,
+            int overlapSize,
+            RegistrationOptions options,
+            SearchOrientation orientation,
+            SearchRegion region)
+        {
+            GetSearchRanges(orientation, options, out int searchRangeX, out int searchRangeY);
             int candidateCountX = searchRangeX * 2 + 1;
             int candidateCountY = searchRangeY * 2 + 1;
 
             EnsureScoreTextures(candidateCountX, candidateCountY);
-            UpdateConstants(first, second, overlapSize, searchRangeX, searchRangeY, options, axis);
+            UpdateConstants(first, second, overlapSize, searchRangeX, searchRangeY, options, orientation, region);
 
             var ctx = _deviceManager.Context;
             ctx.CSSetShader(_computeShader);
@@ -167,63 +223,202 @@ namespace GPUStitch.Core
             ctx.CopyResource(_scoreReadbackTexture!, _scoreTexture!);
             ctx.Flush();
 
-            // GPU 输出的是“搜索空间中的最佳局部修正量”，
-            // 还需要再换算成从第一张图到第二张图的实际相对位移。
-            var best = ReadBestScore(candidateCountX, candidateCountY);
+            return ReadBestScore(candidateCountX, candidateCountY);
+        }
 
-            int relativeOffsetX;
-            int relativeOffsetY;
-
-            if (axis == RegistrationAxis.Horizontal)
+        private static void GetSearchRanges(
+            SearchOrientation orientation,
+            RegistrationOptions options,
+            out int searchRangeX,
+            out int searchRangeY)
+        {
+            if (orientation == SearchOrientation.HorizontalForward ||
+                orientation == SearchOrientation.HorizontalReverse)
             {
-                int baseShiftX = Math.Max(1, first.Width - overlapSize);
-                relativeOffsetX = baseShiftX - best.BestDeltaX;
-                relativeOffsetY = -best.BestDeltaY;
+                searchRangeX = options.SearchRangePrimary;
+                searchRangeY = options.SearchRangeCross;
             }
             else
             {
-                int baseShiftY = Math.Max(1, first.Height - overlapSize);
-                relativeOffsetX = -best.BestDeltaX;
-                relativeOffsetY = baseShiftY - best.BestDeltaY;
+                searchRangeX = options.SearchRangeCross;
+                searchRangeY = options.SearchRangePrimary;
             }
+        }
 
-            bool isConfident = best.Score >= options.ConfidenceThreshold;
-            if (!isConfident)
+        private static (int OffsetX, int OffsetY) ComputeRelativeOffset(
+            int bestDeltaX,
+            int bestDeltaY,
+            GpuImage first,
+            GpuImage second,
+            int overlapSize,
+            SearchOrientation orientation)
+        {
+            switch (orientation)
             {
-                // 当相关性不可信时，系统退回到“仅根据预估重叠得到的保守位移”。
-                // 这样至少能维持整体布局连续，而不是让单条错误边把全局结果拉崩。
-                if (axis == RegistrationAxis.Horizontal)
+                case SearchOrientation.HorizontalForward:
                 {
-                    relativeOffsetX = Math.Max(1, first.Width - overlapSize);
-                    relativeOffsetY = 0;
+                    int baseShiftX = Math.Max(1, first.Width - overlapSize);
+                    return (baseShiftX - bestDeltaX, -bestDeltaY);
+                }
+                case SearchOrientation.VerticalForward:
+                {
+                    int baseShiftY = Math.Max(1, first.Height - overlapSize);
+                    return (-bestDeltaX, baseShiftY - bestDeltaY);
+                }
+                case SearchOrientation.HorizontalReverse:
+                {
+                    int baseShiftX = Math.Max(1, second.Width - overlapSize);
+                    return (-(baseShiftX + bestDeltaX), bestDeltaY);
+                }
+                case SearchOrientation.VerticalReverse:
+                {
+                    int baseShiftY = Math.Max(1, second.Height - overlapSize);
+                    return (bestDeltaX, -(baseShiftY + bestDeltaY));
+                }
+                default:
+                    throw new InvalidOperationException($"未知搜索方向: {orientation}");
+            }
+        }
+
+        private static (int OffsetX, int OffsetY) CreateFallbackOffset(
+            GpuImage first,
+            int overlapSize,
+            RegistrationAxis axis)
+        {
+            if (axis == RegistrationAxis.Horizontal)
+                return (Math.Max(1, first.Width - overlapSize), 0);
+
+            return (0, Math.Max(1, first.Height - overlapSize));
+        }
+
+        private PairRegistrationDiagnostics BuildDiagnostics(
+            GpuImage first,
+            GpuImage second,
+            int overlapSize,
+            RegistrationOptions options,
+            RegistrationAxis axis,
+            BestScoreResult best,
+            int forwardOffsetX,
+            int forwardOffsetY)
+        {
+            SearchOrientation reverseOrientation = axis == RegistrationAxis.Horizontal
+                ? SearchOrientation.HorizontalReverse
+                : SearchOrientation.VerticalReverse;
+
+            var reverse = RunSearch(
+                second,
+                first,
+                overlapSize,
+                options,
+                reverseOrientation,
+                SearchRegion.Full);
+
+            (int reverseOffsetX, int reverseOffsetY) = ComputeRelativeOffset(
+                reverse.BestDeltaX,
+                reverse.BestDeltaY,
+                second,
+                first,
+                overlapSize,
+                reverseOrientation);
+
+            float roundTripErrorX = forwardOffsetX + reverseOffsetX;
+            float roundTripErrorY = forwardOffsetY + reverseOffsetY;
+
+            int validSegments = 0;
+            int minSegmentOffsetX = 0;
+            int maxSegmentOffsetX = 0;
+            int minSegmentOffsetY = 0;
+            int maxSegmentOffsetY = 0;
+
+            var segmentRegions = BuildSegmentRegions(first, second, axis);
+            for (int i = 0; i < segmentRegions.Length; i++)
+            {
+                if (!segmentRegions[i].HasValue)
+                    continue;
+
+                var segment = RunSearch(
+                    first,
+                    second,
+                    overlapSize,
+                    options,
+                    axis == RegistrationAxis.Horizontal
+                        ? SearchOrientation.HorizontalForward
+                        : SearchOrientation.VerticalForward,
+                    segmentRegions[i]!.Value);
+
+                if (segment.Score < options.ConfidenceThreshold)
+                    continue;
+
+                (int segmentOffsetX, int segmentOffsetY) = ComputeRelativeOffset(
+                    segment.BestDeltaX,
+                    segment.BestDeltaY,
+                    first,
+                    second,
+                    overlapSize,
+                    axis == RegistrationAxis.Horizontal
+                        ? SearchOrientation.HorizontalForward
+                        : SearchOrientation.VerticalForward);
+
+                if (validSegments == 0)
+                {
+                    minSegmentOffsetX = maxSegmentOffsetX = segmentOffsetX;
+                    minSegmentOffsetY = maxSegmentOffsetY = segmentOffsetY;
                 }
                 else
                 {
-                    relativeOffsetX = 0;
-                    relativeOffsetY = Math.Max(1, first.Height - overlapSize);
+                    minSegmentOffsetX = Math.Min(minSegmentOffsetX, segmentOffsetX);
+                    maxSegmentOffsetX = Math.Max(maxSegmentOffsetX, segmentOffsetX);
+                    minSegmentOffsetY = Math.Min(minSegmentOffsetY, segmentOffsetY);
+                    maxSegmentOffsetY = Math.Max(maxSegmentOffsetY, segmentOffsetY);
                 }
+
+                validSegments++;
             }
 
-            var result = new PairRegistrationResult(
-                sourceIndex,
-                targetIndex,
-                axis,
-                best.BestDeltaX,
-                best.BestDeltaY,
+            float segmentSpreadX = validSegments >= 2 ? maxSegmentOffsetX - minSegmentOffsetX : 0.0f;
+            float segmentSpreadY = validSegments >= 2 ? maxSegmentOffsetY - minSegmentOffsetY : 0.0f;
+
+            return new PairRegistrationDiagnostics(
                 best.Score,
-                overlapSize,
-                relativeOffsetX,
-                relativeOffsetY,
-                isConfident);
+                best.SecondBestScore,
+                reverse.Score,
+                best.Score - best.SecondBestScore,
+                roundTripErrorX,
+                roundTripErrorY,
+                segmentSpreadX,
+                segmentSpreadY,
+                validSegments);
+        }
 
-            Debug.WriteLine(
-                $"[Registration] 配准 [{sourceIndex}]->[{targetIndex}] {axis}: " +
-                $"score={best.Score:F4}, delta=({best.BestDeltaX},{best.BestDeltaY}), " +
-                $"offset=({relativeOffsetX},{relativeOffsetY}), overlap={overlapSize}, " +
-                $"search=({searchRangeX},{searchRangeY}), " +
-                $"confident={isConfident}{(isConfident ? "" : " [FALLBACK]")}");
+        private static SearchRegion?[] BuildSegmentRegions(
+            GpuImage first,
+            GpuImage second,
+            RegistrationAxis axis)
+        {
+            int crossAxisLength = axis == RegistrationAxis.Horizontal
+                ? Math.Min(first.Height, second.Height)
+                : Math.Min(first.Width, second.Width);
 
-            return result;
+            int usableStart = 1;
+            int usableEnd = Math.Max(usableStart + 1, crossAxisLength - 1);
+            int usableLength = usableEnd - usableStart;
+            if (usableLength < 24)
+            {
+                return new SearchRegion?[] { null, null, null };
+            }
+
+            int segmentLength = usableLength / 3;
+            if (segmentLength < 8)
+            {
+                return new SearchRegion?[] { null, null, null };
+            }
+
+            return new SearchRegion?[]
+            {
+                new SearchRegion(usableStart, usableStart + segmentLength),
+                new SearchRegion(usableStart + segmentLength, usableStart + (segmentLength * 2)),
+                new SearchRegion(usableStart + (segmentLength * 2), usableEnd),
+            };
         }
 
         /// <summary>
@@ -716,11 +911,17 @@ namespace GPUStitch.Core
             int searchRangeX,
             int searchRangeY,
             RegistrationOptions options,
-            RegistrationAxis axis)
+            SearchOrientation orientation,
+            SearchRegion region)
         {
-            int effectiveSampleStep = GetEffectiveSampleStep(first, second, overlapSize, axis, options.SampleStep);
+            RegistrationAxis baseAxis =
+                orientation == SearchOrientation.HorizontalForward || orientation == SearchOrientation.HorizontalReverse
+                    ? RegistrationAxis.Horizontal
+                    : RegistrationAxis.Vertical;
+
+            int effectiveSampleStep = GetEffectiveSampleStep(first, second, overlapSize, baseAxis, options.SampleStep);
             Debug.WriteLine(
-                $"[Reg] UpdateConstants: overlap={overlapSize}, rangeX={searchRangeX}, rangeY={searchRangeY}, axis={axis}, sampleStep={effectiveSampleStep}");
+                $"[Reg] UpdateConstants: overlap={overlapSize}, rangeX={searchRangeX}, rangeY={searchRangeY}, orientation={orientation}, sampleStep={effectiveSampleStep}, region=({region.Start},{region.End})");
             var constants = new RegistrationConstants
             {
                 FirstWidth = first.Width,
@@ -731,8 +932,10 @@ namespace GPUStitch.Core
                 SearchRangeX = searchRangeX,
                 SearchRangeY = searchRangeY,
                 SampleStep = effectiveSampleStep,
-                Orientation = (int)axis,
+                Orientation = (int)orientation,
                 MinSampleCount = options.MinSampleCount,
+                RegionStart = region.Start,
+                RegionEnd = region.End,
                 MinGradientEnergy = options.MinGradientEnergy,
                 MinLumaVariance = options.MinLumaVariance,
                 GradientWeight = options.GradientWeight,
@@ -779,6 +982,7 @@ namespace GPUStitch.Core
             int bestX = 0;
             int bestY = 0;
             float bestScore = float.NegativeInfinity;
+            float secondBestScore = float.NegativeInfinity;
 
             // ScoreTexture 是二维搜索图：
             // x 轴对应 deltaX 候选，y 轴对应 deltaY 候选。
@@ -796,9 +1000,14 @@ namespace GPUStitch.Core
                             float score = row[x];
                             if (score > bestScore)
                             {
+                                secondBestScore = bestScore;
                                 bestScore = score;
                                 bestX = x;
                                 bestY = y;
+                            }
+                            else if (score > secondBestScore)
+                            {
+                                secondBestScore = score;
                             }
                         }
                     }
@@ -812,7 +1021,8 @@ namespace GPUStitch.Core
             return new BestScoreResult(
                 bestX - ((width - 1) / 2),
                 bestY - ((height - 1) / 2),
-                bestScore);
+                bestScore,
+                secondBestScore);
         }
 
         private static int Clamp(int value, int min, int max)
@@ -848,16 +1058,40 @@ namespace GPUStitch.Core
         /// </summary>
         private readonly struct BestScoreResult
         {
-            public BestScoreResult(int bestDeltaX, int bestDeltaY, float score)
+            public BestScoreResult(int bestDeltaX, int bestDeltaY, float score, float secondBestScore)
             {
                 BestDeltaX = bestDeltaX;
                 BestDeltaY = bestDeltaY;
                 Score = score;
+                SecondBestScore = secondBestScore;
             }
 
             public int BestDeltaX { get; }
             public int BestDeltaY { get; }
             public float Score { get; }
+            public float SecondBestScore { get; }
+        }
+
+        private enum SearchOrientation
+        {
+            HorizontalForward = 0,
+            VerticalForward = 1,
+            HorizontalReverse = 2,
+            VerticalReverse = 3,
+        }
+
+        private readonly struct SearchRegion
+        {
+            public static readonly SearchRegion Full = new SearchRegion(1, int.MaxValue);
+
+            public SearchRegion(int start, int end)
+            {
+                Start = start;
+                End = end;
+            }
+
+            public int Start { get; }
+            public int End { get; }
         }
 
         /// <summary>

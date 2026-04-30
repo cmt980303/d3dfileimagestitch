@@ -70,5 +70,95 @@ namespace GPUStitch.Models
                 return sum / PairResults.Count;
             }
         }
+
+        public int WeakPeakPairCount
+        {
+            get
+            {
+                int count = 0;
+                for (int i = 0; i < PairResults.Count; i++)
+                {
+                    if (PairResults[i].Diagnostics.HasWeakPeak)
+                        count++;
+                }
+                return count;
+            }
+        }
+
+        public int RoundTripMismatchPairCount
+        {
+            get
+            {
+                int count = 0;
+                for (int i = 0; i < PairResults.Count; i++)
+                {
+                    if (PairResults[i].Diagnostics.HasRoundTripMismatch)
+                        count++;
+                }
+                return count;
+            }
+        }
+
+        public int LocalDriftPairCount
+        {
+            get
+            {
+                int count = 0;
+                for (int i = 0; i < PairResults.Count; i++)
+                {
+                    if (PairResults[i].Diagnostics.HasLocalDrift)
+                        count++;
+                }
+                return count;
+            }
+        }
+
+        public float AveragePeakMargin
+        {
+            get
+            {
+                if (PairResults.Count == 0)
+                    return 0;
+
+                float sum = 0;
+                for (int i = 0; i < PairResults.Count; i++)
+                {
+                    sum += PairResults[i].Diagnostics.PeakMargin;
+                }
+                return sum / PairResults.Count;
+            }
+        }
+
+        public float AverageRoundTripError
+        {
+            get
+            {
+                if (PairResults.Count == 0)
+                    return 0;
+
+                float sum = 0;
+                for (int i = 0; i < PairResults.Count; i++)
+                {
+                    sum += PairResults[i].Diagnostics.RoundTripErrorMagnitude;
+                }
+                return sum / PairResults.Count;
+            }
+        }
+
+        public float AverageLocalDrift
+        {
+            get
+            {
+                if (PairResults.Count == 0)
+                    return 0;
+
+                float sum = 0;
+                for (int i = 0; i < PairResults.Count; i++)
+                {
+                    sum += PairResults[i].Diagnostics.SegmentSpreadMagnitude;
+                }
+                return sum / PairResults.Count;
+            }
+        }
     }
 }
